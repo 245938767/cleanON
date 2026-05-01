@@ -80,7 +80,7 @@ pub enum RuleOperator {
     In,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FileCategory {
     Documents,
     Images,
@@ -92,13 +92,8 @@ pub enum FileCategory {
     Spreadsheets,
     Presentations,
     Pdf,
+    #[default]
     Other,
-}
-
-impl Default for FileCategory {
-    fn default() -> Self {
-        Self::Other
-    }
 }
 
 impl FileCategory {

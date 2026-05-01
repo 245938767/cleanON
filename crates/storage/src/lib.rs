@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use smart_file_organizer_core::{FileCategory, FileItem, HistorySummaryDto, SkillRule};
+use smart_file_organizer_core::{FileItem, HistorySummaryDto, SkillRule};
 use uuid::Uuid;
 
 const MIGRATION_0001_VERSION: &str = "0001_storage_skill_ai";

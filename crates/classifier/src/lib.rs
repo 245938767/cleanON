@@ -93,7 +93,7 @@ fn skill_match(file: &FileItem, skill: &Skill) -> Option<FileCategory> {
         if !file
             .mime_type
             .as_deref()
-            .is_some_and(|mime| mime.starts_with(&prefix))
+            .is_some_and(|mime| mime.starts_with(prefix))
         {
             return None;
         }

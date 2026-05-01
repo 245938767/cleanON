@@ -1931,6 +1931,7 @@ mod tests {
                 files_to_rename: 0,
             },
             created_at: now,
+            desktop_preview: None,
         };
 
         let patched = apply_plan_patch_with_validation(
@@ -2003,6 +2004,7 @@ mod tests {
                 files_to_rename: 0,
             },
             created_at: chrono::Utc::now().to_rfc3339(),
+            desktop_preview: None,
         };
 
         let error = apply_plan_patch_with_validation(plan, PlanPatchDto { operations: vec![] })
