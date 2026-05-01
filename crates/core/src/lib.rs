@@ -95,6 +95,12 @@ pub enum FileCategory {
     Other,
 }
 
+impl Default for FileCategory {
+    fn default() -> Self {
+        Self::Other
+    }
+}
+
 impl FileCategory {
     pub fn folder_name(&self) -> &'static str {
         match self {
@@ -436,8 +442,23 @@ pub struct Skill {
     pub id: Uuid,
     pub name: String,
     pub enabled: bool,
-    pub rule: String,
+    pub rule: SkillRule,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillRule {
+    #[serde(default)]
+    pub extension: Option<String>,
+    #[serde(default, alias = "file_name_contains")]
+    pub file_name_contains: Option<String>,
+    #[serde(default, alias = "mime_prefix")]
+    pub mime_prefix: Option<String>,
+    #[serde(default)]
+    pub category: FileCategory,
+    #[serde(default, alias = "destination_hint")]
+    pub destination_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -446,23 +467,53 @@ pub struct SkillDto {
     pub id: String,
     pub name: String,
     pub enabled: bool,
-    pub rule: String,
+    pub rule: SkillRule,
     pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillUpdateProposal {
     pub name: String,
-    pub rule: String,
+    pub rule: SkillRule,
     pub enabled: bool,
+    pub evidence: Vec<String>,
+    pub source_event_ids: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillUpdateProposalDto {
     pub name: String,
-    pub rule: String,
+    pub rule: SkillRule,
     pub enabled: bool,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    #[serde(default)]
+    pub source_event_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UserDecisionEvent {
+    pub event_id: Uuid,
+    pub file_name: String,
+    pub extension: Option<String>,
+    pub mime_type: Option<String>,
+    pub decision: UserDecision,
+    pub original_category: Option<FileCategory>,
+    pub final_category: Option<FileCategory>,
+    pub original_destination: Option<PathBuf>,
+    pub final_destination: Option<PathBuf>,
+    pub occurred_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum UserDecision {
+    Accepted,
+    Rejected,
+    EditedDestination,
+    RenamedFolder,
+    RenamedCategory,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

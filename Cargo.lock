@@ -3597,7 +3597,10 @@ dependencies = [
 name = "smart-file-organizer-skill-engine"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "serde",
+ "smart-file-organizer-core",
+ "uuid",
 ]
 
 [[package]]

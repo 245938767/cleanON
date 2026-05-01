@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use smart_file_organizer_core::{FileItem, HistorySummaryDto};
+use smart_file_organizer_core::{FileCategory, FileItem, HistorySummaryDto, SkillRule};
 use uuid::Uuid;
 
 const MIGRATION_0001_VERSION: &str = "0001_storage_skill_ai";
@@ -16,7 +16,7 @@ pub struct StoredSkill {
     pub id: String,
     pub name: String,
     pub enabled: bool,
-    pub rule_json: serde_json::Value,
+    pub rule: SkillRule,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -280,7 +280,7 @@ impl Storage {
     }
 
     pub fn upsert_skill(&self, skill: &StoredSkill) -> Result<()> {
-        let rule_json = serde_json::to_string(&skill.rule_json)?;
+        let rule_json = serde_json::to_string(&skill.rule)?;
         self.conn.execute(
             "INSERT INTO skills(id, name, enabled, rule_json)
              VALUES (?1, ?2, ?3, ?4)
@@ -294,14 +294,44 @@ impl Storage {
         Ok(())
     }
 
+    pub fn list_skills(&self) -> Result<Vec<StoredSkill>> {
+        self.list_skills_where(None)
+    }
+
     pub fn list_enabled_skills(&self) -> Result<Vec<StoredSkill>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, enabled, rule_json FROM skills WHERE enabled = 1 ORDER BY name",
+        self.list_skills_where(Some(true))
+    }
+
+    pub fn disable_skill(&self, id: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE skills SET enabled = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![id],
         )?;
+        Ok(changed > 0)
+    }
+
+    pub fn delete_skill(&self, id: &str) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute("DELETE FROM skills WHERE id = ?1", params![id])?;
+        Ok(changed > 0)
+    }
+
+    fn list_skills_where(&self, enabled: Option<bool>) -> Result<Vec<StoredSkill>> {
+        let sql = match enabled {
+            Some(true) => {
+                "SELECT id, name, enabled, rule_json FROM skills WHERE enabled = 1 ORDER BY name"
+            }
+            Some(false) => {
+                "SELECT id, name, enabled, rule_json FROM skills WHERE enabled = 0 ORDER BY name"
+            }
+            None => "SELECT id, name, enabled, rule_json FROM skills ORDER BY name",
+        };
+        let mut stmt = self.conn.prepare(sql)?;
         let skills = stmt
             .query_map([], |row| {
                 let rule_json: String = row.get(3)?;
-                let rule_json = serde_json::from_str(&rule_json).map_err(|err| {
+                let rule = serde_json::from_str(&rule_json).map_err(|err| {
                     rusqlite::Error::FromSqlConversionFailure(
                         3,
                         rusqlite::types::Type::Text,
@@ -312,7 +342,7 @@ impl Storage {
                     id: row.get(0)?,
                     name: row.get(1)?,
                     enabled: row.get::<_, i64>(2)? != 0,
-                    rule_json,
+                    rule,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -507,7 +537,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use serde_json::json;
-    use smart_file_organizer_core::FileItem;
+    use smart_file_organizer_core::{FileCategory, FileItem, SkillRule};
     use std::path::PathBuf;
     use uuid::Uuid;
 
@@ -530,7 +560,11 @@ mod tests {
                 id: "skill-1".to_string(),
                 name: "PDF docs".to_string(),
                 enabled: true,
-                rule_json: json!({"extension": "pdf", "category": "Documents"}),
+                rule: SkillRule {
+                    extension: Some("pdf".to_string()),
+                    category: FileCategory::Documents,
+                    ..SkillRule::default()
+                },
             })
             .unwrap();
 
@@ -620,6 +654,33 @@ mod tests {
         assert_eq!(storage.list_ai_provider_settings().unwrap().len(), 1);
         assert!(!serialized.to_ascii_lowercase().contains("api_key"));
         assert!(!serialized.to_ascii_lowercase().contains("authorization"));
+    }
+
+    #[test]
+    fn lists_disables_and_deletes_skills() {
+        let storage = Storage::in_memory().unwrap();
+        let skill = StoredSkill {
+            id: "skill-pdf".to_string(),
+            name: "PDF docs".to_string(),
+            enabled: true,
+            rule: SkillRule {
+                extension: Some("pdf".to_string()),
+                category: FileCategory::Documents,
+                destination_hint: Some("Invoices".to_string()),
+                ..SkillRule::default()
+            },
+        };
+
+        storage.upsert_skill(&skill).unwrap();
+        assert_eq!(storage.list_skills().unwrap().len(), 1);
+        assert_eq!(storage.list_enabled_skills().unwrap()[0].rule, skill.rule);
+
+        assert!(storage.disable_skill("skill-pdf").unwrap());
+        assert!(storage.list_enabled_skills().unwrap().is_empty());
+        assert!(!storage.list_skills().unwrap()[0].enabled);
+
+        assert!(storage.delete_skill("skill-pdf").unwrap());
+        assert!(storage.list_skills().unwrap().is_empty());
     }
 
     #[test]
