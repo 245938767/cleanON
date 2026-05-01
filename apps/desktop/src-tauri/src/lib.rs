@@ -4,8 +4,8 @@ use smart_file_organizer_core::{
     ExecutionBatchDto, FileCategory, FileOperationKind, FileOperationPlan, FileRiskLevel,
     GeneratePlanRequestDto, OperationRowDto, OrganizationMode, OrganizationPlan,
     OrganizationPlanDto, PlanSummary, PlanSummaryDto, RollbackEntryDto, RollbackResult,
-    ScanOptions, Skill, SkillDto, SkillUpdateProposalDto, UserApproval, UserApprovalDto,
-    ValidationIssueDto,
+    ScanOptions, Skill, SkillDto, SkillUpdateProposal, SkillUpdateProposalDto, UserApproval,
+    UserApprovalDto, UserDecisionEvent, ValidationIssueDto,
 };
 use std::{
     collections::HashMap,
@@ -225,7 +225,7 @@ async fn rollback_batch(batch: ExecutionBatch) -> Result<RollbackResult, String>
 async fn list_skills(app: AppHandle) -> Result<Vec<SkillDto>, String> {
     let storage = open_storage(&app)?;
     Ok(storage
-        .list_enabled_skills()
+        .list_skills()
         .map_err(|error| error.to_string())?
         .into_iter()
         .map(stored_skill_to_core)
@@ -237,14 +237,12 @@ async fn list_skills(app: AppHandle) -> Result<Vec<SkillDto>, String> {
 async fn save_skill(app: AppHandle, proposal: SkillUpdateProposalDto) -> Result<SkillDto, String> {
     let storage = open_storage(&app)?;
     let id = Uuid::new_v4();
-    let rule_json: serde_json::Value =
-        serde_json::from_str(&proposal.rule).map_err(|error| error.to_string())?;
     storage
         .upsert_skill(&smart_file_organizer_storage::StoredSkill {
             id: id.to_string(),
             name: proposal.name.clone(),
             enabled: proposal.enabled,
-            rule_json,
+            rule: proposal.rule.clone(),
         })
         .map_err(|error| error.to_string())?;
 
@@ -256,6 +254,32 @@ async fn save_skill(app: AppHandle, proposal: SkillUpdateProposalDto) -> Result<
         created_at: chrono::Utc::now(),
     };
     Ok(skill_to_dto(&skill))
+}
+
+#[tauri::command]
+async fn disable_skill(app: AppHandle, id: String) -> Result<bool, String> {
+    let storage = open_storage(&app)?;
+    storage
+        .disable_skill(&id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn delete_skill(app: AppHandle, id: String) -> Result<bool, String> {
+    let storage = open_storage(&app)?;
+    storage.delete_skill(&id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn propose_skill_updates(
+    events: Vec<UserDecisionEvent>,
+) -> Result<Vec<SkillUpdateProposalDto>, String> {
+    Ok(
+        smart_file_organizer_skill_engine::propose_skill_updates(&events)
+            .into_iter()
+            .map(skill_proposal_to_dto)
+            .collect(),
+    )
 }
 
 pub fn run() {
@@ -273,7 +297,10 @@ pub fn run() {
             execute_confirmed_plan,
             rollback_batch,
             list_skills,
-            save_skill
+            save_skill,
+            disable_skill,
+            delete_skill,
+            propose_skill_updates
         ])
         .run(tauri::generate_context!())
         .expect("failed to run app");
@@ -538,7 +565,7 @@ fn stored_skill_to_core(skill: smart_file_organizer_storage::StoredSkill) -> Ski
         id: Uuid::parse_str(&skill.id).unwrap_or_else(|_| Uuid::new_v4()),
         name: skill.name,
         enabled: skill.enabled,
-        rule: skill.rule_json.to_string(),
+        rule: skill.rule,
         created_at: chrono::Utc::now(),
     }
 }
@@ -819,6 +846,20 @@ fn skill_to_dto(skill: &Skill) -> SkillDto {
     }
 }
 
+fn skill_proposal_to_dto(proposal: SkillUpdateProposal) -> SkillUpdateProposalDto {
+    SkillUpdateProposalDto {
+        name: proposal.name,
+        rule: proposal.rule,
+        enabled: proposal.enabled,
+        evidence: proposal.evidence,
+        source_event_ids: proposal
+            .source_event_ids
+            .into_iter()
+            .map(|event_id| event_id.to_string())
+            .collect(),
+    }
+}
+
 fn parse_uuid(value: &str, field: &str) -> Result<Uuid, String> {
     Uuid::parse_str(value).map_err(|error| format!("invalid {field}: {error}"))
 }
@@ -1063,10 +1104,11 @@ mod tests {
                 id: "legacy-skill-id".to_string(),
                 name: "旧版图片归文档".to_string(),
                 enabled: true,
-                rule_json: serde_json::json!({
-                    "extension": "jpg",
-                    "category": "Documents"
-                }),
+                rule: smart_file_organizer_core::SkillRule {
+                    extension: Some("jpg".to_string()),
+                    category: FileCategory::Documents,
+                    ..smart_file_organizer_core::SkillRule::default()
+                },
             })
             .unwrap();
 

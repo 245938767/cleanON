@@ -26,14 +26,6 @@ struct ClassificationCandidate {
     evidence: Vec<String>,
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct SkillRule {
-    extension: Option<String>,
-    file_name_contains: Option<String>,
-    mime_prefix: Option<String>,
-    category: String,
-}
-
 #[async_trait]
 impl Classifier for BasicClassifier {
     async fn classify(
@@ -69,22 +61,19 @@ fn skill_candidate(file: &FileItem, skills: &[Skill]) -> Option<ClassificationCa
         .map(|(skill, category)| ClassificationCandidate {
             category,
             confidence: 0.96,
-            evidence: vec![
-                format!("命中已启用 Skill：{}", skill.name),
-                "Skill 建议优先于内置规则".to_string(),
-            ],
+            evidence: skill_evidence(skill),
         })
 }
 
 fn skill_match(file: &FileItem, skill: &Skill) -> Option<FileCategory> {
-    let rule: SkillRule = serde_json::from_str(&skill.rule).ok()?;
+    let rule = &skill.rule;
     let has_condition =
         rule.extension.is_some() || rule.file_name_contains.is_some() || rule.mime_prefix.is_some();
     if !has_condition {
         return None;
     }
 
-    if let Some(expected) = rule.extension {
+    if let Some(expected) = rule.extension.as_deref() {
         if !file
             .extension
             .as_deref()
@@ -94,13 +83,13 @@ fn skill_match(file: &FileItem, skill: &Skill) -> Option<FileCategory> {
         }
     }
 
-    if let Some(needle) = rule.file_name_contains {
-        if !contains_case_insensitive(&file.file_name, &needle) {
+    if let Some(needle) = rule.file_name_contains.as_deref() {
+        if !contains_case_insensitive(&file.file_name, needle) {
             return None;
         }
     }
 
-    if let Some(prefix) = rule.mime_prefix {
+    if let Some(prefix) = rule.mime_prefix.as_deref() {
         if !file
             .mime_type
             .as_deref()
@@ -110,7 +99,34 @@ fn skill_match(file: &FileItem, skill: &Skill) -> Option<FileCategory> {
         }
     }
 
-    parse_category(&rule.category)
+    Some(rule.category.clone())
+}
+
+fn skill_evidence(skill: &Skill) -> Vec<String> {
+    let mut evidence = vec![
+        format!("命中已启用 Skill：{}", skill.name),
+        "Skill 建议优先于低优先级内置规则".to_string(),
+    ];
+    if let Some(extension) = skill.rule.extension.as_deref() {
+        evidence.push(format!(
+            "Skill 条件：扩展名 .{}",
+            extension.trim_start_matches('.').to_lowercase()
+        ));
+    }
+    if let Some(needle) = skill.rule.file_name_contains.as_deref() {
+        evidence.push(format!("Skill 条件：文件名包含 {needle}"));
+    }
+    if let Some(prefix) = skill.rule.mime_prefix.as_deref() {
+        evidence.push(format!("Skill 条件：MIME 前缀 {prefix}"));
+    }
+    evidence.push(format!(
+        "Skill 目标分类：{}",
+        skill.rule.category.folder_name()
+    ));
+    if let Some(destination_hint) = skill.rule.destination_hint.as_deref() {
+        evidence.push(format!("Skill 目标文件夹提示：{destination_hint}"));
+    }
+    evidence
 }
 
 fn rule_candidate(
@@ -275,23 +291,6 @@ fn mime_category(mime: &str) -> Option<FileCategory> {
     None
 }
 
-fn parse_category(category: &str) -> Option<FileCategory> {
-    match category.trim().to_lowercase().as_str() {
-        "documents" | "document" | "docs" | "文档" => Some(FileCategory::Documents),
-        "images" | "image" | "图片" | "图像" => Some(FileCategory::Images),
-        "videos" | "video" | "视频" => Some(FileCategory::Videos),
-        "audio" | "音频" => Some(FileCategory::Audio),
-        "archives" | "archive" | "压缩包" | "归档" => Some(FileCategory::Archives),
-        "installers" | "installer" | "安装包" => Some(FileCategory::Installers),
-        "code" | "代码" => Some(FileCategory::Code),
-        "spreadsheets" | "spreadsheet" | "表格" => Some(FileCategory::Spreadsheets),
-        "presentations" | "presentation" | "演示文稿" => Some(FileCategory::Presentations),
-        "pdf" => Some(FileCategory::Pdf),
-        "other" | "其他" => Some(FileCategory::Other),
-        _ => None,
-    }
-}
-
 fn contains_case_insensitive(value: &str, needle: &str) -> bool {
     value.to_lowercase().contains(&needle.to_lowercase())
 }
@@ -305,6 +304,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use serde_json::json;
+    use smart_file_organizer_core::SkillRule;
     use std::path::{Path, PathBuf};
     use uuid::Uuid;
 
@@ -445,19 +445,22 @@ mod tests {
                 id: Uuid::new_v4(),
                 name: "空 Skill".to_string(),
                 enabled: true,
-                rule: json!({"category": "Archives"}).to_string(),
+                rule: SkillRule {
+                    category: FileCategory::Archives,
+                    ..SkillRule::default()
+                },
                 created_at: Utc::now(),
             },
             Skill {
                 id: Uuid::new_v4(),
                 name: "发票进入文档".to_string(),
                 enabled: true,
-                rule: json!({
-                    "extension": "pdf",
-                    "file_name_contains": "发票",
-                    "category": "Documents"
-                })
-                .to_string(),
+                rule: SkillRule {
+                    extension: Some("pdf".to_string()),
+                    file_name_contains: Some("发票".to_string()),
+                    category: FileCategory::Documents,
+                    ..SkillRule::default()
+                },
                 created_at: Utc::now(),
             },
         ];
