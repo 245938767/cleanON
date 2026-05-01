@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use smart_file_organizer_core::FileItem;
+use smart_file_organizer_core::{FileItem, HistorySummaryDto};
 use uuid::Uuid;
 
 const MIGRATION_0001_VERSION: &str = "0001_storage_skill_ai";
@@ -234,10 +234,47 @@ impl Storage {
         let rollback_json = serde_json::to_string(rollback_json)?;
         self.conn.execute(
             "INSERT INTO execution_batches(id, plan_id, status, rollback_json)
-             VALUES (?1, ?2, ?3, ?4)",
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+               plan_id = excluded.plan_id,
+               status = excluded.status,
+               rollback_json = excluded.rollback_json",
             params![id, plan_id, status, rollback_json],
         )?;
         Ok(())
+    }
+
+    pub fn list_execution_batches(&self) -> Result<Vec<HistorySummaryDto>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, plan_id, status, rollback_json, created_at
+             FROM execution_batches
+             ORDER BY created_at DESC, id DESC",
+        )?;
+        let batches = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let plan_id: String = row.get(1)?;
+                let status: String = row.get(2)?;
+                let rollback_json: String = row.get(3)?;
+                let created_at: String = row.get(4)?;
+                row_to_history_summary(id, plan_id, status, rollback_json, created_at)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(batches)
+    }
+
+    pub fn load_execution_batch(&self, id: &str) -> Result<Option<serde_json::Value>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT rollback_json FROM execution_batches WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        raw.map(|value| serde_json::from_str(&value).context("parse stored execution batch json"))
+            .transpose()
     }
 
     pub fn upsert_skill(&self, skill: &StoredSkill) -> Result<()> {
@@ -337,6 +374,57 @@ fn row_to_file_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileItem> {
     })
 }
 
+fn row_to_history_summary(
+    batch_id: String,
+    plan_id: String,
+    status: String,
+    rollback_json: String,
+    created_at: String,
+) -> rusqlite::Result<HistorySummaryDto> {
+    let value: serde_json::Value = serde_json::from_str(&rollback_json).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(err))
+    })?;
+
+    let operation_count = value
+        .get("executedOperations")
+        .and_then(|value| value.as_array())
+        .map(Vec::len)
+        .or_else(|| {
+            value
+                .get("executed_operations")
+                .and_then(|value| value.as_array())
+                .map(Vec::len)
+        })
+        .unwrap_or(0);
+    let error_count = value
+        .get("errors")
+        .and_then(|value| value.as_array())
+        .map(Vec::len)
+        .unwrap_or(0);
+    let started_at = value
+        .get("startedAt")
+        .or_else(|| value.get("started_at"))
+        .and_then(|value| value.as_str())
+        .unwrap_or(&created_at)
+        .to_string();
+    let finished_at = value
+        .get("finishedAt")
+        .or_else(|| value.get("finished_at"))
+        .and_then(|value| value.as_str())
+        .unwrap_or(&created_at)
+        .to_string();
+
+    Ok(HistorySummaryDto {
+        batch_id,
+        plan_id,
+        status,
+        operation_count,
+        error_count,
+        started_at,
+        finished_at,
+    })
+}
+
 fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -393,7 +481,45 @@ mod tests {
             .unwrap();
 
         assert_eq!(storage.load_plan("plan-1").unwrap(), Some(plan));
+        assert_eq!(
+            storage.load_execution_batch("batch-1").unwrap(),
+            Some(json!({"undo": []}))
+        );
+        assert_eq!(storage.list_execution_batches().unwrap().len(), 1);
         assert_eq!(storage.list_enabled_skills().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn lists_execution_batches_from_stored_batch_json() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .save_plan("plan-1", &json!({"planId": "plan-1"}))
+            .unwrap();
+        storage
+            .record_execution_batch(
+                "batch-1",
+                "plan-1",
+                "partially_failed",
+                &json!({
+                    "batchId": "batch-1",
+                    "planId": "plan-1",
+                    "status": "partially_failed",
+                    "executedOperations": [{"operationId": "op-1"}],
+                    "rollbackEntries": [{"operationId": "op-1"}],
+                    "errors": [{"message": "failed"}],
+                    "startedAt": "2026-01-01T00:00:00Z",
+                    "finishedAt": "2026-01-01T00:00:01Z"
+                }),
+            )
+            .unwrap();
+
+        let summaries = storage.list_execution_batches().unwrap();
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].batch_id, "batch-1");
+        assert_eq!(summaries[0].operation_count, 1);
+        assert_eq!(summaries[0].error_count, 1);
+        assert_eq!(summaries[0].started_at, "2026-01-01T00:00:00Z");
     }
 
     #[test]
