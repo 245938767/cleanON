@@ -29,6 +29,7 @@ smart-file-organizer-core = { path = "../../../crates/core" }
 smart-file-organizer-scanner = { path = "../../../crates/scanner" }
 smart-file-organizer-classifier = { path = "../../../crates/classifier" }
 smart-file-organizer-planner = { path = "../../../crates/planner" }
+smart-file-organizer-platform = { path = "../../../crates/platform" }
 smart-file-organizer-executor = { path = "../../../crates/executor" }
 smart-file-organizer-skill-engine = { path = "../../../crates/skill-engine" }
 smart-file-organizer-storage = { path = "../../../crates/storage" }

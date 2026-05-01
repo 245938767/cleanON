@@ -92,9 +92,11 @@ fn target_folder(
     classification: &smart_file_organizer_core::ClassificationResult,
 ) -> PathBuf {
     match input.mode {
-        OrganizationMode::ByCategory | OrganizationMode::Desktop => {
-            input.root_path.join(classification.category.folder_name())
-        }
+        OrganizationMode::ByCategory => input.root_path.join(classification.category.folder_name()),
+        OrganizationMode::Desktop => smart_file_organizer_platform::desktop_archive_folder(
+            &input.root_path,
+            &classification.category,
+        ),
         OrganizationMode::ByExtension => input.root_path.join(
             classification
                 .file
@@ -185,6 +187,32 @@ mod tests {
         assert_eq!(plan.summary.files_to_move, 1);
         assert!(plan.operations.iter().any(|operation| {
             matches!(&operation.kind, FileOperationKind::CreateFolder { path } if path == &root.join("PDF"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn desktop_mode_builds_archive_plan_without_coordinate_operations() {
+        let root = PathBuf::from("/tmp/Desktop");
+        let plan = DefaultPlanBuilder
+            .build_plan(BuildPlanInput {
+                task_id: "desktop-task".to_string(),
+                root_path: root.clone(),
+                mode: OrganizationMode::Desktop,
+                classifications: vec![classified_pdf(root.clone())],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(plan.mode, OrganizationMode::Desktop);
+        assert!(plan.operations.iter().all(|operation| matches!(
+            operation.kind,
+            FileOperationKind::CreateFolder { .. } | FileOperationKind::MoveFile { .. }
+        )));
+        assert!(plan.operations.iter().any(|operation| {
+            matches!(&operation.kind, FileOperationKind::CreateFolder { path } if path == &root.join("Desktop Archive").join("PDF"))
+        }));
+        assert!(plan.operations.iter().any(|operation| {
+            matches!(&operation.kind, FileOperationKind::MoveFile { destination, .. } if destination == &root.join("Desktop Archive").join("PDF").join("a.pdf"))
         }));
     }
 }
