@@ -22,6 +22,7 @@ pub struct StoredSkill {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AiProviderSettings {
     pub provider: String,
+    pub base_url: Option<String>,
     pub cloud_enabled: bool,
     pub model: Option<String>,
 }
@@ -58,6 +59,7 @@ impl Storage {
         self.conn
             .execute_batch(MIGRATION_0001_SQL)
             .context("apply base migration")?;
+        self.ensure_ai_provider_settings_base_url()?;
         self.conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?1)",
             params![MIGRATION_0001_VERSION],
@@ -319,19 +321,46 @@ impl Storage {
 
     pub fn save_ai_provider_settings(&self, settings: &AiProviderSettings) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO ai_provider_settings(provider, cloud_enabled, model)
-             VALUES (?1, ?2, ?3)
+            "INSERT INTO ai_provider_settings(provider, base_url, cloud_enabled, model)
+             VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(provider) DO UPDATE SET
+               base_url = excluded.base_url,
                cloud_enabled = excluded.cloud_enabled,
                model = excluded.model,
                updated_at = CURRENT_TIMESTAMP",
             params![
                 settings.provider,
+                settings.base_url,
                 settings.cloud_enabled as i64,
                 settings.model
             ],
         )?;
         Ok(())
+    }
+
+    pub fn get_ai_provider_settings(&self, provider: &str) -> Result<Option<AiProviderSettings>> {
+        self.conn
+            .query_row(
+                "SELECT provider, base_url, cloud_enabled, model
+                 FROM ai_provider_settings
+                 WHERE provider = ?1",
+                params![provider],
+                row_to_ai_provider_settings,
+            )
+            .optional()
+            .context("load ai provider settings")
+    }
+
+    pub fn list_ai_provider_settings(&self) -> Result<Vec<AiProviderSettings>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT provider, base_url, cloud_enabled, model
+             FROM ai_provider_settings
+             ORDER BY provider",
+        )?;
+        let settings = stmt
+            .query_map([], row_to_ai_provider_settings)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(settings)
     }
 
     pub fn table_columns(&self, table: &str) -> Result<Vec<String>> {
@@ -343,6 +372,31 @@ impl Storage {
             .collect::<std::result::Result<Vec<String>, _>>()?;
         Ok(columns)
     }
+
+    fn ensure_ai_provider_settings_base_url(&self) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare("PRAGMA table_info(ai_provider_settings)")?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if !columns.iter().any(|column| column == "base_url") {
+            self.conn.execute(
+                "ALTER TABLE ai_provider_settings ADD COLUMN base_url TEXT",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn row_to_ai_provider_settings(row: &rusqlite::Row<'_>) -> rusqlite::Result<AiProviderSettings> {
+    Ok(AiProviderSettings {
+        provider: row.get(0)?,
+        base_url: row.get(1)?,
+        cloud_enabled: row.get::<_, i64>(2)? != 0,
+        model: row.get(3)?,
+    })
 }
 
 fn row_to_file_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileItem> {
@@ -528,6 +582,7 @@ mod tests {
         storage
             .save_ai_provider_settings(&AiProviderSettings {
                 provider: "mock".to_string(),
+                base_url: None,
                 cloud_enabled: false,
                 model: Some("local-test".to_string()),
             })
@@ -535,8 +590,36 @@ mod tests {
 
         let columns = storage.table_columns("ai_provider_settings").unwrap();
         assert!(columns.contains(&"provider".to_string()));
+        assert!(columns.contains(&"base_url".to_string()));
         assert!(!columns.iter().any(|column| column.contains("key")));
         assert!(!columns.iter().any(|column| column.contains("secret")));
+    }
+
+    #[test]
+    fn ai_provider_settings_roundtrip_without_credentials() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .save_ai_provider_settings(&AiProviderSettings {
+                provider: "openai-compatible".to_string(),
+                base_url: Some("https://api.deepseek.example/v1".to_string()),
+                cloud_enabled: true,
+                model: Some("deepseek-chat".to_string()),
+            })
+            .unwrap();
+
+        let loaded = storage
+            .get_ai_provider_settings("openai-compatible")
+            .unwrap()
+            .unwrap();
+        let serialized = serde_json::to_string(&loaded).unwrap();
+
+        assert_eq!(
+            loaded.base_url.as_deref(),
+            Some("https://api.deepseek.example/v1")
+        );
+        assert_eq!(storage.list_ai_provider_settings().unwrap().len(), 1);
+        assert!(!serialized.to_ascii_lowercase().contains("api_key"));
+        assert!(!serialized.to_ascii_lowercase().contains("authorization"));
     }
 
     #[test]

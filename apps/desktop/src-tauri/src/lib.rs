@@ -75,6 +75,56 @@ pub struct ClassifyFilesRequest {
     pub root_path: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProviderDto {
+    pub provider: String,
+    pub label: String,
+    pub requires_base_url: bool,
+    pub requires_api_key: bool,
+    pub cloud: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSettingsDto {
+    pub provider: String,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub cloud_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSettingsListDto {
+    pub providers: Vec<ModelProviderDto>,
+    pub saved_settings: Vec<ModelSettingsDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TestModelRequest {
+    pub settings: ModelSettingsDto,
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TestModelConnectionResponse {
+    pub provider: String,
+    pub request_valid: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TestModelJsonOutputResponse {
+    pub provider: String,
+    pub valid: bool,
+    pub summary: String,
+    pub categories_count: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ClassificationResultDto {
@@ -350,6 +400,73 @@ async fn save_skill(app: AppHandle, proposal: SkillUpdateProposalDto) -> Result<
     Ok(skill_to_dto(&skill))
 }
 
+#[tauri::command]
+async fn list_model_settings(app: AppHandle) -> Result<ModelSettingsListDto, String> {
+    let storage = open_storage(&app)?;
+    list_model_settings_with_storage(&storage)
+}
+
+#[tauri::command]
+async fn save_model_settings(
+    app: AppHandle,
+    settings: ModelSettingsDto,
+) -> Result<ModelSettingsDto, String> {
+    let storage = open_storage(&app)?;
+    save_model_settings_with_storage(&storage, settings)
+}
+
+#[tauri::command]
+async fn test_model_connection(
+    request: TestModelRequest,
+) -> Result<TestModelConnectionResponse, String> {
+    let config = model_settings_to_provider_config(&request.settings);
+    let credentials = request
+        .api_key
+        .as_deref()
+        .filter(|key| !key.trim().is_empty())
+        .map(smart_file_organizer_ai_gateway::ProviderCredentials::new);
+    let result =
+        smart_file_organizer_ai_gateway::test_provider_connection(&config, credentials.as_ref())
+            .map_err(|error| error.to_string())?;
+    Ok(TestModelConnectionResponse {
+        provider: result.provider,
+        request_valid: result.request_valid,
+        message: result.message,
+    })
+}
+
+#[tauri::command]
+async fn test_model_json_output(
+    request: TestModelRequest,
+) -> Result<TestModelJsonOutputResponse, String> {
+    let config = model_settings_to_provider_config(&request.settings);
+    let credentials = request
+        .api_key
+        .as_deref()
+        .filter(|key| !key.trim().is_empty())
+        .map(smart_file_organizer_ai_gateway::ProviderCredentials::new);
+    let sanitized = sample_sanitized_ai_request();
+    smart_file_organizer_ai_gateway::build_provider_request(
+        &config,
+        &sanitized,
+        credentials.as_ref(),
+    )
+    .map_err(|error| error.to_string())?;
+    let raw = sample_provider_json_response(&request.settings.provider);
+    let suggestion = smart_file_organizer_ai_gateway::parse_provider_response(
+        &request.settings.provider,
+        &raw,
+        &sanitized,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(TestModelJsonOutputResponse {
+        provider: suggestion.provider,
+        valid: true,
+        summary: suggestion.summary,
+        categories_count: suggestion.categories.len(),
+    })
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(ScanRegistry::default())
@@ -370,7 +487,11 @@ pub fn run() {
             load_execution_batch,
             rollback_batch_by_id,
             list_skills,
-            save_skill
+            save_skill,
+            list_model_settings,
+            save_model_settings,
+            test_model_connection,
+            test_model_json_output
         ])
         .run(tauri::generate_context!())
         .expect("failed to run app");
@@ -729,6 +850,109 @@ fn stored_skill_to_core(skill: smart_file_organizer_storage::StoredSkill) -> Ski
         enabled: skill.enabled,
         rule: skill.rule_json.to_string(),
         created_at: chrono::Utc::now(),
+    }
+}
+
+fn list_model_settings_with_storage(
+    storage: &smart_file_organizer_storage::Storage,
+) -> Result<ModelSettingsListDto, String> {
+    let providers = smart_file_organizer_ai_gateway::provider_registry()
+        .into_iter()
+        .map(|provider| ModelProviderDto {
+            provider: provider.provider,
+            label: provider.label,
+            requires_base_url: provider.requires_base_url,
+            requires_api_key: provider.requires_api_key,
+            cloud: provider.cloud,
+        })
+        .collect();
+    let saved_settings = storage
+        .list_ai_provider_settings()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(storage_model_settings_to_dto)
+        .collect();
+    Ok(ModelSettingsListDto {
+        providers,
+        saved_settings,
+    })
+}
+
+fn save_model_settings_with_storage(
+    storage: &smart_file_organizer_storage::Storage,
+    settings: ModelSettingsDto,
+) -> Result<ModelSettingsDto, String> {
+    let config = model_settings_to_provider_config(&settings);
+    smart_file_organizer_ai_gateway::validate_provider_config(&config)
+        .map_err(|error| error.to_string())?;
+    storage
+        .save_ai_provider_settings(&smart_file_organizer_storage::AiProviderSettings {
+            provider: settings.provider.clone(),
+            base_url: settings.base_url.clone(),
+            cloud_enabled: settings.cloud_enabled,
+            model: settings.model.clone(),
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(settings)
+}
+
+fn storage_model_settings_to_dto(
+    settings: smart_file_organizer_storage::AiProviderSettings,
+) -> ModelSettingsDto {
+    ModelSettingsDto {
+        provider: settings.provider,
+        base_url: settings.base_url,
+        model: settings.model,
+        cloud_enabled: settings.cloud_enabled,
+    }
+}
+
+fn model_settings_to_provider_config(
+    settings: &ModelSettingsDto,
+) -> smart_file_organizer_ai_gateway::ProviderConfig {
+    smart_file_organizer_ai_gateway::ProviderConfig {
+        provider: settings.provider.clone(),
+        base_url: settings.base_url.clone(),
+        model: settings.model.clone(),
+        cloud_enabled: settings.cloud_enabled,
+    }
+}
+
+fn sample_sanitized_ai_request() -> smart_file_organizer_ai_gateway::SanitizedAiRequest {
+    smart_file_organizer_ai_gateway::SanitizedAiRequest {
+        prompt: "Return a JSON suggestion for this sanitized file list.".to_string(),
+        files: vec![smart_file_organizer_ai_gateway::SanitizedFileInput {
+            token: "file_test".to_string(),
+            extension: Some("txt".to_string()),
+            mime: Some("text/plain".to_string()),
+            size_bucket: smart_file_organizer_ai_gateway::SizeBucket::Small,
+            path_depth: 1,
+        }],
+    }
+}
+
+fn sample_provider_json_response(provider: &str) -> String {
+    let content = serde_json::json!({
+        "summary": "JSON output validation passed.",
+        "categories": [
+            {
+                "file_token": "file_test",
+                "category": "Documents",
+                "confidence": 90
+            }
+        ]
+    })
+    .to_string();
+
+    match smart_file_organizer_ai_gateway::parse_provider_kind(provider) {
+        Ok(smart_file_organizer_ai_gateway::ProviderKind::OpenAiCompatible) => serde_json::json!({
+            "choices": [{"message": {"content": content}}]
+        })
+        .to_string(),
+        Ok(smart_file_organizer_ai_gateway::ProviderKind::Ollama) => {
+            serde_json::json!({ "response": content }).to_string()
+        }
+        _ => content,
     }
 }
 
@@ -1715,5 +1939,52 @@ mod tests {
             smart_file_organizer_core::RollbackAction::MoveFileBack { from, to }
                 if from == &moved && to == &original
         ));
+    }
+
+    #[test]
+    fn model_settings_commands_save_without_api_key() {
+        let storage = smart_file_organizer_storage::Storage::in_memory().unwrap();
+        let saved = save_model_settings_with_storage(
+            &storage,
+            ModelSettingsDto {
+                provider: "openai-compatible".to_string(),
+                base_url: Some("https://api.deepseek.example/v1".to_string()),
+                model: Some("deepseek-chat".to_string()),
+                cloud_enabled: true,
+            },
+        )
+        .unwrap();
+        let listed = list_model_settings_with_storage(&storage).unwrap();
+        let serialized = serde_json::to_string(&listed).unwrap();
+
+        assert_eq!(saved.provider, "openai-compatible");
+        assert!(listed
+            .providers
+            .iter()
+            .any(|provider| provider.provider == "ollama"));
+        assert_eq!(listed.saved_settings.len(), 1);
+        assert!(!serialized.contains("sk-runtime-only"));
+        assert!(!serialized.to_ascii_lowercase().contains("api_key"));
+    }
+
+    #[tokio::test]
+    async fn model_test_commands_validate_request_shape_and_json_output() {
+        let request = TestModelRequest {
+            settings: ModelSettingsDto {
+                provider: "openai-compatible".to_string(),
+                base_url: Some("https://api.kimi.example/v1".to_string()),
+                model: Some("kimi-k2".to_string()),
+                cloud_enabled: true,
+            },
+            api_key: Some("sk-runtime-only".to_string()),
+        };
+
+        let connection = test_model_connection(request.clone()).await.unwrap();
+        let json_output = test_model_json_output(request).await.unwrap();
+
+        assert!(connection.request_valid);
+        assert!(connection.message.contains("/chat/completions"));
+        assert!(json_output.valid);
+        assert_eq!(json_output.categories_count, 1);
     }
 }
