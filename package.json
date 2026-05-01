@@ -1,0 +1,16 @@
+{
+  "name": "smart-file-organizer",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.21.0",
+  "scripts": {
+    "dev": "pnpm --filter desktop dev",
+    "build": "pnpm --filter desktop build",
+    "lint": "pnpm --filter desktop lint",
+    "test": "pnpm --filter desktop test",
+    "tauri": "pnpm --filter desktop tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.9.0"
+  }
+}

@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Rust build output
+target/
+
+# Frontend build output
+dist/
+apps/desktop/dist/
+apps/desktop/src-tauri/gen/
+
+# Local env
+.env
+.env.*
+
+# Test/browser artifacts
+test-results/
+playwright-report/
+.playwright-mcp/
+.omx/
+*.png
+!apps/desktop/src-tauri/icons/icon.png
+!apps/desktop/public/visuals/*.png
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/

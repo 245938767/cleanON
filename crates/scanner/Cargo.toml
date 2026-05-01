@@ -1,0 +1,20 @@
+[package]
+name = "smart-file-organizer-scanner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+mime_guess.workspace = true
+sha2.workspace = true
+smart-file-organizer-core = { path = "../core" }
+smart-file-organizer-platform = { path = "../platform" }
+uuid.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true

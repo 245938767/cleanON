@@ -1,0 +1,20 @@
+[package]
+name = "smart-file-organizer-executor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+smart-file-organizer-core = { path = "../core" }
+smart-file-organizer-rollback = { path = "../rollback" }
+uuid.workspace = true
+
+[dev-dependencies]
+smart-file-organizer-classifier = { path = "../classifier" }
+smart-file-organizer-planner = { path = "../planner" }
+smart-file-organizer-scanner = { path = "../scanner" }
+tempfile.workspace = true
+tokio.workspace = true

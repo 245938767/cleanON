@@ -1,0 +1,37 @@
+[package]
+name = "smart-file-organizer-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "smart_file_organizer_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "smart-file-organizer-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tokio.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+smart-file-organizer-core = { path = "../../../crates/core" }
+smart-file-organizer-scanner = { path = "../../../crates/scanner" }
+smart-file-organizer-classifier = { path = "../../../crates/classifier" }
+smart-file-organizer-planner = { path = "../../../crates/planner" }
+smart-file-organizer-executor = { path = "../../../crates/executor" }
+smart-file-organizer-skill-engine = { path = "../../../crates/skill-engine" }
+smart-file-organizer-storage = { path = "../../../crates/storage" }
+
+[dev-dependencies]
+tempfile.workspace = true

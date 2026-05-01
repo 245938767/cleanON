@@ -1,0 +1,15 @@
+[package]
+name = "smart-file-organizer-planner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+smart-file-organizer-core = { path = "../core" }
+uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
