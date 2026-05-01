@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use smart_file_organizer_core::FileItem;
+use smart_file_organizer_core::{FileItem, HistorySummaryDto, SkillRule};
 use uuid::Uuid;
 
 const MIGRATION_0001_VERSION: &str = "0001_storage_skill_ai";
@@ -16,12 +16,13 @@ pub struct StoredSkill {
     pub id: String,
     pub name: String,
     pub enabled: bool,
-    pub rule_json: serde_json::Value,
+    pub rule: SkillRule,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AiProviderSettings {
     pub provider: String,
+    pub base_url: Option<String>,
     pub cloud_enabled: bool,
     pub model: Option<String>,
 }
@@ -58,6 +59,7 @@ impl Storage {
         self.conn
             .execute_batch(MIGRATION_0001_SQL)
             .context("apply base migration")?;
+        self.ensure_ai_provider_settings_base_url()?;
         self.conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?1)",
             params![MIGRATION_0001_VERSION],
@@ -234,14 +236,51 @@ impl Storage {
         let rollback_json = serde_json::to_string(rollback_json)?;
         self.conn.execute(
             "INSERT INTO execution_batches(id, plan_id, status, rollback_json)
-             VALUES (?1, ?2, ?3, ?4)",
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+               plan_id = excluded.plan_id,
+               status = excluded.status,
+               rollback_json = excluded.rollback_json",
             params![id, plan_id, status, rollback_json],
         )?;
         Ok(())
     }
 
+    pub fn list_execution_batches(&self) -> Result<Vec<HistorySummaryDto>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, plan_id, status, rollback_json, created_at
+             FROM execution_batches
+             ORDER BY created_at DESC, id DESC",
+        )?;
+        let batches = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let plan_id: String = row.get(1)?;
+                let status: String = row.get(2)?;
+                let rollback_json: String = row.get(3)?;
+                let created_at: String = row.get(4)?;
+                row_to_history_summary(id, plan_id, status, rollback_json, created_at)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(batches)
+    }
+
+    pub fn load_execution_batch(&self, id: &str) -> Result<Option<serde_json::Value>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT rollback_json FROM execution_batches WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        raw.map(|value| serde_json::from_str(&value).context("parse stored execution batch json"))
+            .transpose()
+    }
+
     pub fn upsert_skill(&self, skill: &StoredSkill) -> Result<()> {
-        let rule_json = serde_json::to_string(&skill.rule_json)?;
+        let rule_json = serde_json::to_string(&skill.rule)?;
         self.conn.execute(
             "INSERT INTO skills(id, name, enabled, rule_json)
              VALUES (?1, ?2, ?3, ?4)
@@ -255,14 +294,44 @@ impl Storage {
         Ok(())
     }
 
+    pub fn list_skills(&self) -> Result<Vec<StoredSkill>> {
+        self.list_skills_where(None)
+    }
+
     pub fn list_enabled_skills(&self) -> Result<Vec<StoredSkill>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, enabled, rule_json FROM skills WHERE enabled = 1 ORDER BY name",
+        self.list_skills_where(Some(true))
+    }
+
+    pub fn disable_skill(&self, id: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE skills SET enabled = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![id],
         )?;
+        Ok(changed > 0)
+    }
+
+    pub fn delete_skill(&self, id: &str) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute("DELETE FROM skills WHERE id = ?1", params![id])?;
+        Ok(changed > 0)
+    }
+
+    fn list_skills_where(&self, enabled: Option<bool>) -> Result<Vec<StoredSkill>> {
+        let sql = match enabled {
+            Some(true) => {
+                "SELECT id, name, enabled, rule_json FROM skills WHERE enabled = 1 ORDER BY name"
+            }
+            Some(false) => {
+                "SELECT id, name, enabled, rule_json FROM skills WHERE enabled = 0 ORDER BY name"
+            }
+            None => "SELECT id, name, enabled, rule_json FROM skills ORDER BY name",
+        };
+        let mut stmt = self.conn.prepare(sql)?;
         let skills = stmt
             .query_map([], |row| {
                 let rule_json: String = row.get(3)?;
-                let rule_json = serde_json::from_str(&rule_json).map_err(|err| {
+                let rule = serde_json::from_str(&rule_json).map_err(|err| {
                     rusqlite::Error::FromSqlConversionFailure(
                         3,
                         rusqlite::types::Type::Text,
@@ -273,7 +342,7 @@ impl Storage {
                     id: row.get(0)?,
                     name: row.get(1)?,
                     enabled: row.get::<_, i64>(2)? != 0,
-                    rule_json,
+                    rule,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -282,19 +351,46 @@ impl Storage {
 
     pub fn save_ai_provider_settings(&self, settings: &AiProviderSettings) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO ai_provider_settings(provider, cloud_enabled, model)
-             VALUES (?1, ?2, ?3)
+            "INSERT INTO ai_provider_settings(provider, base_url, cloud_enabled, model)
+             VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(provider) DO UPDATE SET
+               base_url = excluded.base_url,
                cloud_enabled = excluded.cloud_enabled,
                model = excluded.model,
                updated_at = CURRENT_TIMESTAMP",
             params![
                 settings.provider,
+                settings.base_url,
                 settings.cloud_enabled as i64,
                 settings.model
             ],
         )?;
         Ok(())
+    }
+
+    pub fn get_ai_provider_settings(&self, provider: &str) -> Result<Option<AiProviderSettings>> {
+        self.conn
+            .query_row(
+                "SELECT provider, base_url, cloud_enabled, model
+                 FROM ai_provider_settings
+                 WHERE provider = ?1",
+                params![provider],
+                row_to_ai_provider_settings,
+            )
+            .optional()
+            .context("load ai provider settings")
+    }
+
+    pub fn list_ai_provider_settings(&self) -> Result<Vec<AiProviderSettings>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT provider, base_url, cloud_enabled, model
+             FROM ai_provider_settings
+             ORDER BY provider",
+        )?;
+        let settings = stmt
+            .query_map([], row_to_ai_provider_settings)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(settings)
     }
 
     pub fn table_columns(&self, table: &str) -> Result<Vec<String>> {
@@ -306,6 +402,31 @@ impl Storage {
             .collect::<std::result::Result<Vec<String>, _>>()?;
         Ok(columns)
     }
+
+    fn ensure_ai_provider_settings_base_url(&self) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare("PRAGMA table_info(ai_provider_settings)")?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if !columns.iter().any(|column| column == "base_url") {
+            self.conn.execute(
+                "ALTER TABLE ai_provider_settings ADD COLUMN base_url TEXT",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn row_to_ai_provider_settings(row: &rusqlite::Row<'_>) -> rusqlite::Result<AiProviderSettings> {
+    Ok(AiProviderSettings {
+        provider: row.get(0)?,
+        base_url: row.get(1)?,
+        cloud_enabled: row.get::<_, i64>(2)? != 0,
+        model: row.get(3)?,
+    })
 }
 
 fn row_to_file_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileItem> {
@@ -337,6 +458,57 @@ fn row_to_file_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileItem> {
     })
 }
 
+fn row_to_history_summary(
+    batch_id: String,
+    plan_id: String,
+    status: String,
+    rollback_json: String,
+    created_at: String,
+) -> rusqlite::Result<HistorySummaryDto> {
+    let value: serde_json::Value = serde_json::from_str(&rollback_json).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(err))
+    })?;
+
+    let operation_count = value
+        .get("executedOperations")
+        .and_then(|value| value.as_array())
+        .map(Vec::len)
+        .or_else(|| {
+            value
+                .get("executed_operations")
+                .and_then(|value| value.as_array())
+                .map(Vec::len)
+        })
+        .unwrap_or(0);
+    let error_count = value
+        .get("errors")
+        .and_then(|value| value.as_array())
+        .map(Vec::len)
+        .unwrap_or(0);
+    let started_at = value
+        .get("startedAt")
+        .or_else(|| value.get("started_at"))
+        .and_then(|value| value.as_str())
+        .unwrap_or(&created_at)
+        .to_string();
+    let finished_at = value
+        .get("finishedAt")
+        .or_else(|| value.get("finished_at"))
+        .and_then(|value| value.as_str())
+        .unwrap_or(&created_at)
+        .to_string();
+
+    Ok(HistorySummaryDto {
+        batch_id,
+        plan_id,
+        status,
+        operation_count,
+        error_count,
+        started_at,
+        finished_at,
+    })
+}
+
 fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -365,7 +537,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use serde_json::json;
-    use smart_file_organizer_core::FileItem;
+    use smart_file_organizer_core::{FileCategory, FileItem, SkillRule};
     use std::path::PathBuf;
     use uuid::Uuid;
 
@@ -388,12 +560,54 @@ mod tests {
                 id: "skill-1".to_string(),
                 name: "PDF docs".to_string(),
                 enabled: true,
-                rule_json: json!({"extension": "pdf", "category": "Documents"}),
+                rule: SkillRule {
+                    extension: Some("pdf".to_string()),
+                    category: FileCategory::Documents,
+                    ..SkillRule::default()
+                },
             })
             .unwrap();
 
         assert_eq!(storage.load_plan("plan-1").unwrap(), Some(plan));
+        assert_eq!(
+            storage.load_execution_batch("batch-1").unwrap(),
+            Some(json!({"undo": []}))
+        );
+        assert_eq!(storage.list_execution_batches().unwrap().len(), 1);
         assert_eq!(storage.list_enabled_skills().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn lists_execution_batches_from_stored_batch_json() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .save_plan("plan-1", &json!({"planId": "plan-1"}))
+            .unwrap();
+        storage
+            .record_execution_batch(
+                "batch-1",
+                "plan-1",
+                "partially_failed",
+                &json!({
+                    "batchId": "batch-1",
+                    "planId": "plan-1",
+                    "status": "partially_failed",
+                    "executedOperations": [{"operationId": "op-1"}],
+                    "rollbackEntries": [{"operationId": "op-1"}],
+                    "errors": [{"message": "failed"}],
+                    "startedAt": "2026-01-01T00:00:00Z",
+                    "finishedAt": "2026-01-01T00:00:01Z"
+                }),
+            )
+            .unwrap();
+
+        let summaries = storage.list_execution_batches().unwrap();
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].batch_id, "batch-1");
+        assert_eq!(summaries[0].operation_count, 1);
+        assert_eq!(summaries[0].error_count, 1);
+        assert_eq!(summaries[0].started_at, "2026-01-01T00:00:00Z");
     }
 
     #[test]
@@ -402,6 +616,7 @@ mod tests {
         storage
             .save_ai_provider_settings(&AiProviderSettings {
                 provider: "mock".to_string(),
+                base_url: None,
                 cloud_enabled: false,
                 model: Some("local-test".to_string()),
             })
@@ -409,8 +624,63 @@ mod tests {
 
         let columns = storage.table_columns("ai_provider_settings").unwrap();
         assert!(columns.contains(&"provider".to_string()));
+        assert!(columns.contains(&"base_url".to_string()));
         assert!(!columns.iter().any(|column| column.contains("key")));
         assert!(!columns.iter().any(|column| column.contains("secret")));
+    }
+
+    #[test]
+    fn ai_provider_settings_roundtrip_without_credentials() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .save_ai_provider_settings(&AiProviderSettings {
+                provider: "openai-compatible".to_string(),
+                base_url: Some("https://api.deepseek.example/v1".to_string()),
+                cloud_enabled: true,
+                model: Some("deepseek-chat".to_string()),
+            })
+            .unwrap();
+
+        let loaded = storage
+            .get_ai_provider_settings("openai-compatible")
+            .unwrap()
+            .unwrap();
+        let serialized = serde_json::to_string(&loaded).unwrap();
+
+        assert_eq!(
+            loaded.base_url.as_deref(),
+            Some("https://api.deepseek.example/v1")
+        );
+        assert_eq!(storage.list_ai_provider_settings().unwrap().len(), 1);
+        assert!(!serialized.to_ascii_lowercase().contains("api_key"));
+        assert!(!serialized.to_ascii_lowercase().contains("authorization"));
+    }
+
+    #[test]
+    fn lists_disables_and_deletes_skills() {
+        let storage = Storage::in_memory().unwrap();
+        let skill = StoredSkill {
+            id: "skill-pdf".to_string(),
+            name: "PDF docs".to_string(),
+            enabled: true,
+            rule: SkillRule {
+                extension: Some("pdf".to_string()),
+                category: FileCategory::Documents,
+                destination_hint: Some("Invoices".to_string()),
+                ..SkillRule::default()
+            },
+        };
+
+        storage.upsert_skill(&skill).unwrap();
+        assert_eq!(storage.list_skills().unwrap().len(), 1);
+        assert_eq!(storage.list_enabled_skills().unwrap()[0].rule, skill.rule);
+
+        assert!(storage.disable_skill("skill-pdf").unwrap());
+        assert!(storage.list_enabled_skills().unwrap().is_empty());
+        assert!(!storage.list_skills().unwrap()[0].enabled);
+
+        assert!(storage.delete_skill("skill-pdf").unwrap());
+        assert!(storage.list_skills().unwrap().is_empty());
     }
 
     #[test]

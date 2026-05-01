@@ -6,3 +6,8 @@ license.workspace = true
 
 [dependencies]
 serde.workspace = true
+smart-file-organizer-core = { path = "../core" }
+
+[dev-dependencies]
+chrono.workspace = true
+uuid.workspace = true

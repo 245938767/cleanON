@@ -416,4 +416,70 @@ mod tests {
             .iter()
             .any(|issue| issue.message.contains("destination already exists")));
     }
+
+    #[tokio::test]
+    async fn partial_failure_records_error_and_preserves_prior_rollback_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_source = temp.path().join("first.txt");
+        let second_source = temp.path().join("second.txt");
+        let blocked_parent = temp.path().join("blocked");
+        fs::write(&first_source, b"first").unwrap();
+        fs::write(&second_source, b"second").unwrap();
+        fs::write(&blocked_parent, b"not a directory").unwrap();
+
+        let first_operation_id = Uuid::new_v4();
+        let second_operation_id = Uuid::new_v4();
+        let plan = OrganizationPlan {
+            plan_id: Uuid::new_v4(),
+            task_id: "partial".to_string(),
+            root_path: temp.path().to_path_buf(),
+            mode: OrganizationMode::ByCategory,
+            operations: vec![
+                smart_file_organizer_core::FileOperationPlan {
+                    operation_id: first_operation_id,
+                    kind: FileOperationKind::MoveFile {
+                        source: first_source.clone(),
+                        destination: temp.path().join("Done").join("first.txt"),
+                    },
+                    reason: "first succeeds".to_string(),
+                    file_id: None,
+                },
+                smart_file_organizer_core::FileOperationPlan {
+                    operation_id: second_operation_id,
+                    kind: FileOperationKind::MoveFile {
+                        source: second_source,
+                        destination: blocked_parent.join("second.txt"),
+                    },
+                    reason: "second fails at parent creation".to_string(),
+                    file_id: None,
+                },
+            ],
+            summary: smart_file_organizer_core::PlanSummary {
+                files_considered: 2,
+                folders_to_create: 0,
+                files_to_move: 2,
+                files_to_rename: 0,
+            },
+            created_at: Utc::now(),
+        };
+        let approval = UserApproval {
+            approved: true,
+            approved_plan_id: plan.plan_id,
+            approved_at: Utc::now(),
+            actor: None,
+        };
+
+        let batch = DefaultPlanExecutor
+            .execute_confirmed(&plan, &approval)
+            .await
+            .unwrap();
+
+        assert_eq!(batch.status, ExecutionStatus::PartiallyFailed);
+        assert_eq!(batch.executed_operations.len(), 1);
+        assert_eq!(batch.rollback_entries.len(), 1);
+        assert_eq!(batch.rollback_entries[0].operation_id, first_operation_id);
+        assert_eq!(batch.errors.len(), 1);
+        assert_eq!(batch.errors[0].operation_id, Some(second_operation_id));
+        assert!(batch.errors[0].message.contains("failed to create"));
+    }
 }
