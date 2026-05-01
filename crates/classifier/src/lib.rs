@@ -5,6 +5,7 @@ use smart_file_organizer_core::{
     ClassificationContext, ClassificationResult, ClassificationRule, FileCategory, FileItem,
     FileRiskLevel, RuleCondition, RuleField, RuleOperator, Skill,
 };
+use std::cmp::Reverse;
 
 #[async_trait]
 pub trait Classifier: Send + Sync {
@@ -120,7 +121,7 @@ fn rule_candidate(
         .iter()
         .filter(|rule| rule.enabled && !rule.conditions.is_empty())
         .collect::<Vec<_>>();
-    enabled_rules.sort_by(|left, right| right.priority.cmp(&left.priority));
+    enabled_rules.sort_by_key(|rule| Reverse(rule.priority));
 
     enabled_rules
         .into_iter()
