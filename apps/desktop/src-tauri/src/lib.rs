@@ -725,6 +725,16 @@ async fn build_prepared_plan(
         })
         .collect::<HashMap<_, _>>();
 
+    let desktop_preview = if prepared.mode == OrganizationMode::Desktop {
+        Some(smart_file_organizer_platform::build_desktop_preview(
+            smart_file_organizer_platform::current_desktop_platform(),
+            &prepared.root_path,
+            &classifications,
+        ))
+    } else {
+        None
+    };
+
     let plan = DefaultPlanBuilder
         .build_plan(smart_file_organizer_core::BuildPlanInput {
             task_id: prepared.task_id,
@@ -739,7 +749,9 @@ async fn build_prepared_plan(
         .validate_plan(&plan)
         .await
         .map_err(|error| error.to_string())?;
-    Ok(plan_to_dto(&plan, &validation, &risk_by_file_id))
+    let mut dto = plan_to_dto(&plan, &validation, &risk_by_file_id);
+    dto.desktop_preview = desktop_preview;
+    Ok(dto)
 }
 
 async fn apply_plan_patch_with_validation(
@@ -1018,6 +1030,7 @@ fn plan_to_dto(
             files_to_rename: plan.summary.files_to_rename,
         },
         created_at: plan.created_at.to_rfc3339(),
+        desktop_preview: None,
     }
 }
 
@@ -1744,6 +1757,65 @@ mod tests {
         assert!(plan.rows.iter().all(|row| !row.editable_target.is_empty()));
     }
 
+    #[tokio::test]
+    async fn desktop_plan_returns_preview_but_only_file_archive_operations_execute() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("a.pdf"), b"pdf").unwrap();
+        fs::write(temp.path().join("photo.jpg"), b"jpg").unwrap();
+        let storage = smart_file_organizer_storage::Storage::in_memory().unwrap();
+        let registry = ScanRegistry::default();
+
+        scan_folder_with_storage(
+            &storage,
+            &registry,
+            ScanFolderRequest {
+                task_id: Some("task-desktop".to_string()),
+                root_path: path_to_string(temp.path()),
+                recursive: true,
+                max_depth: None,
+                include_hidden: false,
+                follow_symlinks: false,
+            },
+        )
+        .unwrap();
+
+        let prepared = prepare_generate_plan(
+            &storage,
+            GeneratePlanRequestDto {
+                task_id: "task-desktop".to_string(),
+                root_path: path_to_string(temp.path()),
+                mode: "desktop".to_string(),
+                classifications: None,
+            },
+        )
+        .unwrap();
+        let plan = build_prepared_plan(prepared).await.unwrap();
+        let preview = plan.desktop_preview.as_ref().unwrap();
+
+        assert_eq!(plan.mode, "desktop");
+        assert!(!preview.capabilities.supports_icon_coordinate_writeback);
+        assert!(!preview.capabilities.supports_pixel_perfect_layout);
+        assert_eq!(preview.before_groups.len(), 2);
+        assert_eq!(preview.after_zones.len(), 2);
+        assert!(preview
+            .after_zones
+            .iter()
+            .all(|zone| zone.archive_folder.contains("Desktop Archive")));
+        assert!(plan
+            .rows
+            .iter()
+            .all(|row| matches!(row.operation_type.as_str(), "create_folder" | "move_file")));
+        assert!(plan.rows.iter().any(|row| {
+            row.operation_type == "move_file" && row.target.contains("Desktop Archive")
+        }));
+
+        let core_plan = plan_dto_to_core(plan).unwrap();
+        assert!(core_plan.operations.iter().all(|operation| matches!(
+            operation.kind,
+            FileOperationKind::CreateFolder { .. } | FileOperationKind::MoveFile { .. }
+        )));
+    }
+
     #[test]
     fn plan_and_approval_dtos_convert_to_core_execution_contract() {
         let plan_id = Uuid::new_v4();
@@ -1779,6 +1851,7 @@ mod tests {
                 files_to_rename: 0,
             },
             created_at: now.clone(),
+            desktop_preview: None,
         };
         let approval = UserApprovalDto {
             approved: true,

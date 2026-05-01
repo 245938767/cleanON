@@ -3520,6 +3520,7 @@ dependencies = [
  "smart-file-organizer-core",
  "smart-file-organizer-executor",
  "smart-file-organizer-planner",
+ "smart-file-organizer-platform",
  "smart-file-organizer-scanner",
  "smart-file-organizer-skill-engine",
  "smart-file-organizer-storage",
@@ -3557,6 +3558,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "smart-file-organizer-core",
+ "smart-file-organizer-platform",
  "tokio",
  "uuid",
 ]
@@ -3564,6 +3566,11 @@ dependencies = [
 [[package]]
 name = "smart-file-organizer-platform"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+ "smart-file-organizer-core",
+ "uuid",
+]
 
 [[package]]
 name = "smart-file-organizer-rollback"
