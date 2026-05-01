@@ -144,6 +144,30 @@ pub struct BuildPlanInput {
     pub classifications: Vec<ClassificationResult>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneratePlanRequestDto {
+    pub task_id: String,
+    pub root_path: String,
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifications: Option<Vec<ClassificationInputDto>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassificationInputDto {
+    pub file_id: String,
+    pub category: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category_key: Option<String>,
+    pub confidence: f32,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    #[serde(default)]
+    pub risk: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OrganizationPlan {
     pub plan_id: Uuid,
@@ -153,6 +177,52 @@ pub struct OrganizationPlan {
     pub operations: Vec<FileOperationPlan>,
     pub summary: PlanSummary,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizationPlanDto {
+    pub plan_id: String,
+    pub task_id: String,
+    pub root_path: String,
+    pub mode: String,
+    pub rows: Vec<OperationRowDto>,
+    pub summary: PlanSummaryDto,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanSummaryDto {
+    pub files_considered: usize,
+    pub folders_to_create: usize,
+    pub files_to_move: usize,
+    pub files_to_rename: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationRowDto {
+    pub operation_id: String,
+    pub operation_type: String,
+    pub title: String,
+    pub source: Option<String>,
+    pub target: String,
+    pub reason: String,
+    pub risk: String,
+    pub selected: bool,
+    pub editable_target: String,
+    #[serde(default)]
+    pub validation_issues: Vec<ValidationIssueDto>,
+    pub conflict_status: String,
+    pub file_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidationIssueDto {
+    pub operation_id: Option<String>,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -213,6 +283,15 @@ pub struct UserApproval {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UserApprovalDto {
+    pub approved: bool,
+    pub approved_plan_id: String,
+    pub approved_at: String,
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanValidation {
     pub valid: bool,
     pub issues: Vec<ValidationIssue>,
@@ -260,6 +339,36 @@ pub struct ExecutionBatch {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionBatchDto {
+    pub batch_id: String,
+    pub plan_id: String,
+    pub status: String,
+    pub executed_operations: Vec<ExecutedOperationDto>,
+    pub rollback_entries: Vec<RollbackEntryDto>,
+    pub errors: Vec<ExecutionErrorDto>,
+    pub started_at: String,
+    pub finished_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutedOperationDto {
+    pub operation_id: String,
+    pub operation_type: String,
+    pub source: Option<String>,
+    pub target: String,
+    pub completed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionErrorDto {
+    pub operation_id: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutedOperation {
     pub operation_id: Uuid,
     pub kind: FileOperationKind,
@@ -278,6 +387,29 @@ pub struct RollbackEntry {
     pub operation_id: Uuid,
     pub action: RollbackAction,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RollbackEntryDto {
+    pub batch_id: String,
+    pub operation_id: String,
+    pub action: String,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HistorySummaryDto {
+    pub batch_id: String,
+    pub plan_id: String,
+    pub status: String,
+    pub operation_count: usize,
+    pub error_count: usize,
+    pub started_at: String,
+    pub finished_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -309,10 +441,36 @@ pub struct Skill {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillDto {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub rule: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillUpdateProposal {
     pub name: String,
     pub rule: String,
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillUpdateProposalDto {
+    pub name: String,
+    pub rule: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSettingsDto {
+    pub provider: String,
+    pub cloud_enabled: bool,
+    pub model: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]

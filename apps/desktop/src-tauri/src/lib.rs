@@ -1,7 +1,11 @@
 use serde::{Deserialize, Serialize};
 use smart_file_organizer_core::{
-    ClassificationContext, ExecutionBatch, FileCategory, FileRiskLevel, OrganizationMode,
-    OrganizationPlan, ScanOptions, Skill, SkillUpdateProposal, UserApproval,
+    ClassificationContext, ClassificationInputDto, ExecutedOperationDto, ExecutionBatch,
+    ExecutionBatchDto, FileCategory, FileOperationKind, FileOperationPlan, FileRiskLevel,
+    GeneratePlanRequestDto, OperationRowDto, OrganizationMode, OrganizationPlan,
+    OrganizationPlanDto, PlanSummary, PlanSummaryDto, RollbackEntryDto, RollbackResult,
+    ScanOptions, Skill, SkillDto, SkillUpdateProposalDto, UserApproval, UserApprovalDto,
+    ValidationIssueDto,
 };
 use std::{
     collections::HashMap,
@@ -76,6 +80,7 @@ pub struct ClassifyFilesRequest {
 pub struct ClassificationResultDto {
     pub file_id: String,
     pub category: String,
+    pub category_key: String,
     pub confidence: f32,
     pub evidence: Vec<String>,
     pub risk: String,
@@ -164,47 +169,50 @@ async fn classify_files(
 
 #[tauri::command]
 async fn generate_plan(
-    task_id: String,
-    root_path: String,
-    classifications: Vec<smart_file_organizer_core::ClassificationResult>,
-    mode: OrganizationMode,
-) -> Result<OrganizationPlan, String> {
-    use smart_file_organizer_planner::{DefaultPlanBuilder, PlanBuilder};
-
-    DefaultPlanBuilder
-        .build_plan(smart_file_organizer_core::BuildPlanInput {
-            task_id,
-            root_path: root_path.into(),
-            mode,
-            classifications,
-        })
-        .await
-        .map_err(|error| error.to_string())
+    app: AppHandle,
+    request: GeneratePlanRequestDto,
+) -> Result<OrganizationPlanDto, String> {
+    let prepared = {
+        let storage = open_storage(&app)?;
+        prepare_generate_plan(&storage, request)?
+    };
+    let dto = build_prepared_plan(prepared).await?;
+    {
+        let storage = open_storage(&app)?;
+        storage
+            .save_plan(
+                &dto.plan_id,
+                &serde_json::to_value(&dto).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(dto)
 }
 
 #[tauri::command]
-async fn review_plan(plan: OrganizationPlan) -> Result<OrganizationPlan, String> {
+async fn review_plan(plan: OrganizationPlanDto) -> Result<OrganizationPlanDto, String> {
     Ok(plan)
 }
 
 #[tauri::command]
 async fn execute_confirmed_plan(
-    plan: OrganizationPlan,
-    approval: UserApproval,
-) -> Result<ExecutionBatch, String> {
+    plan: OrganizationPlanDto,
+    approval: UserApprovalDto,
+) -> Result<ExecutionBatchDto, String> {
     use smart_file_organizer_executor::{DefaultPlanExecutor, PlanExecutor};
 
+    let plan = plan_dto_to_core(plan)?;
+    let approval = approval_dto_to_core(approval)?;
     let executor = DefaultPlanExecutor;
-    executor
+    let batch = executor
         .execute_confirmed(&plan, &approval)
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    Ok(execution_batch_to_dto(&batch))
 }
 
 #[tauri::command]
-async fn rollback_batch(
-    batch: ExecutionBatch,
-) -> Result<smart_file_organizer_core::RollbackResult, String> {
+async fn rollback_batch(batch: ExecutionBatch) -> Result<RollbackResult, String> {
     use smart_file_organizer_executor::{DefaultPlanExecutor, PlanExecutor};
 
     DefaultPlanExecutor
@@ -214,18 +222,19 @@ async fn rollback_batch(
 }
 
 #[tauri::command]
-async fn list_skills(app: AppHandle) -> Result<Vec<Skill>, String> {
+async fn list_skills(app: AppHandle) -> Result<Vec<SkillDto>, String> {
     let storage = open_storage(&app)?;
     Ok(storage
         .list_enabled_skills()
         .map_err(|error| error.to_string())?
         .into_iter()
         .map(stored_skill_to_core)
+        .map(|skill| skill_to_dto(&skill))
         .collect())
 }
 
 #[tauri::command]
-async fn save_skill(app: AppHandle, proposal: SkillUpdateProposal) -> Result<Skill, String> {
+async fn save_skill(app: AppHandle, proposal: SkillUpdateProposalDto) -> Result<SkillDto, String> {
     let storage = open_storage(&app)?;
     let id = Uuid::new_v4();
     let rule_json: serde_json::Value =
@@ -239,13 +248,14 @@ async fn save_skill(app: AppHandle, proposal: SkillUpdateProposal) -> Result<Ski
         })
         .map_err(|error| error.to_string())?;
 
-    Ok(Skill {
+    let skill = Skill {
         id,
         name: proposal.name,
         enabled: proposal.enabled,
         rule: proposal.rule,
         created_at: chrono::Utc::now(),
-    })
+    };
+    Ok(skill_to_dto(&skill))
 }
 
 pub fn run() {
@@ -375,6 +385,17 @@ async fn classify_loaded_files(
     files: Vec<smart_file_organizer_core::FileItem>,
     context: ClassificationContext,
 ) -> Result<Vec<ClassificationResultDto>, String> {
+    Ok(classify_loaded_core(files, context)
+        .await?
+        .into_iter()
+        .map(classification_to_dto)
+        .collect())
+}
+
+async fn classify_loaded_core(
+    files: Vec<smart_file_organizer_core::FileItem>,
+    context: ClassificationContext,
+) -> Result<Vec<smart_file_organizer_core::ClassificationResult>, String> {
     use smart_file_organizer_classifier::{BasicClassifier, Classifier};
 
     let classifier = BasicClassifier;
@@ -384,9 +405,132 @@ async fn classify_loaded_files(
             .classify(&file, &context)
             .await
             .map_err(|error| error.to_string())?;
-        results.push(classification_to_dto(result));
+        results.push(result);
     }
     Ok(results)
+}
+
+enum PreparedClassifications {
+    Ready(Vec<smart_file_organizer_core::ClassificationResult>),
+    NeedsClassification(
+        Vec<smart_file_organizer_core::FileItem>,
+        ClassificationContext,
+    ),
+}
+
+struct PreparedGeneratePlan {
+    task_id: String,
+    root_path: PathBuf,
+    mode: OrganizationMode,
+    classifications: PreparedClassifications,
+}
+
+fn prepare_generate_plan(
+    storage: &smart_file_organizer_storage::Storage,
+    request: GeneratePlanRequestDto,
+) -> Result<PreparedGeneratePlan, String> {
+    let mode = parse_mode(&request.mode)?;
+    let root_path = PathBuf::from(&request.root_path);
+    let classifications = match request.classifications {
+        Some(classifications) => PreparedClassifications::Ready(classifications_from_dto(
+            storage,
+            &request.task_id,
+            &root_path,
+            classifications,
+        )?),
+        None => {
+            let (files, context) = load_classification_input(
+                storage,
+                ClassifyFilesRequest {
+                    task_id: request.task_id.clone(),
+                    root_path: request.root_path.clone(),
+                },
+            )?;
+            PreparedClassifications::NeedsClassification(files, context)
+        }
+    };
+
+    Ok(PreparedGeneratePlan {
+        task_id: request.task_id,
+        root_path,
+        mode,
+        classifications,
+    })
+}
+
+async fn build_prepared_plan(
+    prepared: PreparedGeneratePlan,
+) -> Result<OrganizationPlanDto, String> {
+    use smart_file_organizer_executor::{DefaultPlanExecutor, PlanExecutor};
+    use smart_file_organizer_planner::{DefaultPlanBuilder, PlanBuilder};
+
+    let classifications = match prepared.classifications {
+        PreparedClassifications::Ready(classifications) => classifications,
+        PreparedClassifications::NeedsClassification(files, context) => {
+            classify_loaded_core(files, context).await?
+        }
+    };
+    let risk_by_file_id = classifications
+        .iter()
+        .map(|classification| {
+            (
+                classification.file.id,
+                risk_label(&classification.risk).to_string(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    let plan = DefaultPlanBuilder
+        .build_plan(smart_file_organizer_core::BuildPlanInput {
+            task_id: prepared.task_id,
+            root_path: prepared.root_path,
+            mode: prepared.mode,
+            classifications,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let validation = DefaultPlanExecutor
+        .validate_plan(&plan)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(plan_to_dto(&plan, &validation, &risk_by_file_id))
+}
+
+fn classifications_from_dto(
+    storage: &smart_file_organizer_storage::Storage,
+    task_id: &str,
+    root_path: &Path,
+    dtos: Vec<ClassificationInputDto>,
+) -> Result<Vec<smart_file_organizer_core::ClassificationResult>, String> {
+    let mut files = storage
+        .list_files_for_task(task_id)
+        .map_err(|error| error.to_string())?;
+    if files.is_empty() {
+        files = storage
+            .list_files_for_root(root_path)
+            .map_err(|error| error.to_string())?;
+    }
+    let files_by_id = files
+        .into_iter()
+        .map(|file| (file.id.to_string(), file))
+        .collect::<HashMap<_, _>>();
+
+    dtos.into_iter()
+        .map(|dto| {
+            let file = files_by_id
+                .get(&dto.file_id)
+                .cloned()
+                .ok_or_else(|| format!("classification file not found: {}", dto.file_id))?;
+            Ok(smart_file_organizer_core::ClassificationResult {
+                file,
+                category: parse_category(dto.category_key.as_deref().unwrap_or(&dto.category))?,
+                confidence: dto.confidence,
+                evidence: dto.evidence,
+                risk: parse_risk(&dto.risk)?,
+            })
+        })
+        .collect()
 }
 
 fn stored_skill_to_core(skill: smart_file_organizer_storage::StoredSkill) -> Skill {
@@ -405,9 +549,299 @@ fn classification_to_dto(
     ClassificationResultDto {
         file_id: result.file.id.to_string(),
         category: category_label(&result.category).to_string(),
+        category_key: category_key(&result.category).to_string(),
         confidence: result.confidence,
         evidence: result.evidence,
         risk: risk_label(&result.risk).to_string(),
+    }
+}
+
+fn plan_to_dto(
+    plan: &OrganizationPlan,
+    validation: &smart_file_organizer_core::PlanValidation,
+    risk_by_file_id: &HashMap<Uuid, String>,
+) -> OrganizationPlanDto {
+    OrganizationPlanDto {
+        plan_id: plan.plan_id.to_string(),
+        task_id: plan.task_id.clone(),
+        root_path: path_to_string(&plan.root_path),
+        mode: mode_key(&plan.mode).to_string(),
+        rows: plan
+            .operations
+            .iter()
+            .map(|operation| operation_to_row_dto(operation, validation, risk_by_file_id))
+            .collect(),
+        summary: PlanSummaryDto {
+            files_considered: plan.summary.files_considered,
+            folders_to_create: plan.summary.folders_to_create,
+            files_to_move: plan.summary.files_to_move,
+            files_to_rename: plan.summary.files_to_rename,
+        },
+        created_at: plan.created_at.to_rfc3339(),
+    }
+}
+
+fn operation_to_row_dto(
+    operation: &FileOperationPlan,
+    validation: &smart_file_organizer_core::PlanValidation,
+    risk_by_file_id: &HashMap<Uuid, String>,
+) -> OperationRowDto {
+    let operation_issues = validation
+        .issues
+        .iter()
+        .filter(|issue| issue.operation_id == Some(operation.operation_id))
+        .map(validation_issue_to_dto)
+        .collect::<Vec<_>>();
+    let (operation_type, title, source, target) = match &operation.kind {
+        FileOperationKind::CreateFolder { path } => (
+            "create_folder",
+            format!("创建文件夹 {}", display_name(path)),
+            None,
+            path_to_string(path),
+        ),
+        FileOperationKind::MoveFile {
+            source,
+            destination,
+        } => (
+            "move_file",
+            format!("移动 {}", display_name(source)),
+            Some(path_to_string(source)),
+            path_to_string(destination),
+        ),
+        FileOperationKind::RenameFile {
+            source,
+            destination,
+        } => (
+            "rename_file",
+            format!("重命名 {}", display_name(source)),
+            Some(path_to_string(source)),
+            path_to_string(destination),
+        ),
+    };
+    let conflict_status = if operation_issues.is_empty() {
+        "none"
+    } else {
+        "blocked"
+    };
+
+    OperationRowDto {
+        operation_id: operation.operation_id.to_string(),
+        operation_type: operation_type.to_string(),
+        title,
+        source,
+        target: target.clone(),
+        reason: operation.reason.clone(),
+        risk: if operation_issues.is_empty() {
+            operation
+                .file_id
+                .and_then(|file_id| risk_by_file_id.get(&file_id).cloned())
+                .unwrap_or_else(|| "low".to_string())
+        } else {
+            "high".to_string()
+        },
+        selected: true,
+        editable_target: target,
+        validation_issues: operation_issues,
+        conflict_status: conflict_status.to_string(),
+        file_id: operation.file_id.map(|id| id.to_string()),
+    }
+}
+
+fn validation_issue_to_dto(
+    issue: &smart_file_organizer_core::ValidationIssue,
+) -> ValidationIssueDto {
+    ValidationIssueDto {
+        operation_id: issue.operation_id.map(|id| id.to_string()),
+        message: issue.message.clone(),
+    }
+}
+
+fn plan_dto_to_core(plan: OrganizationPlanDto) -> Result<OrganizationPlan, String> {
+    let plan_id = parse_uuid(&plan.plan_id, "plan_id")?;
+    let root_path = PathBuf::from(&plan.root_path);
+    let mode = parse_mode(&plan.mode)?;
+    let operations = plan
+        .rows
+        .into_iter()
+        .filter(|row| row.selected)
+        .map(row_dto_to_operation)
+        .collect::<Result<Vec<_>, _>>()?;
+    let summary = summarize_operations(plan.summary.files_considered, &operations);
+    let created_at = chrono::DateTime::parse_from_rfc3339(&plan.created_at)
+        .map_err(|error| format!("invalid plan created_at: {error}"))?
+        .with_timezone(&chrono::Utc);
+
+    Ok(OrganizationPlan {
+        plan_id,
+        task_id: plan.task_id,
+        root_path,
+        mode,
+        operations,
+        summary,
+        created_at,
+    })
+}
+
+fn row_dto_to_operation(row: OperationRowDto) -> Result<FileOperationPlan, String> {
+    let operation_id = parse_uuid(&row.operation_id, "operation_id")?;
+    let file_id = row
+        .file_id
+        .as_deref()
+        .map(|id| parse_uuid(id, "file_id"))
+        .transpose()?;
+    let target = PathBuf::from(if row.editable_target.is_empty() {
+        row.target
+    } else {
+        row.editable_target
+    });
+    let kind = match row.operation_type.as_str() {
+        "create_folder" => FileOperationKind::CreateFolder { path: target },
+        "move_file" => FileOperationKind::MoveFile {
+            source: row
+                .source
+                .map(PathBuf::from)
+                .ok_or_else(|| "move_file row missing source".to_string())?,
+            destination: target,
+        },
+        "rename_file" => FileOperationKind::RenameFile {
+            source: row
+                .source
+                .map(PathBuf::from)
+                .ok_or_else(|| "rename_file row missing source".to_string())?,
+            destination: target,
+        },
+        other => return Err(format!("unsupported operation_type: {other}")),
+    };
+
+    Ok(FileOperationPlan {
+        operation_id,
+        kind,
+        reason: row.reason,
+        file_id,
+    })
+}
+
+fn summarize_operations(files_considered: usize, operations: &[FileOperationPlan]) -> PlanSummary {
+    PlanSummary {
+        files_considered,
+        folders_to_create: operations
+            .iter()
+            .filter(|operation| matches!(operation.kind, FileOperationKind::CreateFolder { .. }))
+            .count(),
+        files_to_move: operations
+            .iter()
+            .filter(|operation| matches!(operation.kind, FileOperationKind::MoveFile { .. }))
+            .count(),
+        files_to_rename: operations
+            .iter()
+            .filter(|operation| matches!(operation.kind, FileOperationKind::RenameFile { .. }))
+            .count(),
+    }
+}
+
+fn approval_dto_to_core(approval: UserApprovalDto) -> Result<UserApproval, String> {
+    Ok(UserApproval {
+        approved: approval.approved,
+        approved_plan_id: parse_uuid(&approval.approved_plan_id, "approved_plan_id")?,
+        approved_at: chrono::DateTime::parse_from_rfc3339(&approval.approved_at)
+            .map_err(|error| format!("invalid approved_at: {error}"))?
+            .with_timezone(&chrono::Utc),
+        actor: approval.actor,
+    })
+}
+
+fn execution_batch_to_dto(batch: &ExecutionBatch) -> ExecutionBatchDto {
+    ExecutionBatchDto {
+        batch_id: batch.batch_id.to_string(),
+        plan_id: batch.plan_id.to_string(),
+        status: execution_status_key(&batch.status).to_string(),
+        executed_operations: batch
+            .executed_operations
+            .iter()
+            .map(|operation| {
+                let (operation_type, source, target) = operation_kind_parts(&operation.kind);
+                ExecutedOperationDto {
+                    operation_id: operation.operation_id.to_string(),
+                    operation_type: operation_type.to_string(),
+                    source,
+                    target,
+                    completed_at: operation.completed_at.to_rfc3339(),
+                }
+            })
+            .collect(),
+        rollback_entries: batch.rollback_entries.iter().map(rollback_to_dto).collect(),
+        errors: batch
+            .errors
+            .iter()
+            .map(|error| smart_file_organizer_core::ExecutionErrorDto {
+                operation_id: error.operation_id.map(|id| id.to_string()),
+                message: error.message.clone(),
+            })
+            .collect(),
+        started_at: batch.started_at.to_rfc3339(),
+        finished_at: batch.finished_at.to_rfc3339(),
+    }
+}
+
+fn rollback_to_dto(entry: &smart_file_organizer_core::RollbackEntry) -> RollbackEntryDto {
+    let (action, from, to) = match &entry.action {
+        smart_file_organizer_core::RollbackAction::RemoveCreatedFolder { path } => {
+            ("remove_created_folder", Some(path_to_string(path)), None)
+        }
+        smart_file_organizer_core::RollbackAction::MoveFileBack { from, to } => (
+            "move_file_back",
+            Some(path_to_string(from)),
+            Some(path_to_string(to)),
+        ),
+        smart_file_organizer_core::RollbackAction::RenameFileBack { from, to } => (
+            "rename_file_back",
+            Some(path_to_string(from)),
+            Some(path_to_string(to)),
+        ),
+    };
+    RollbackEntryDto {
+        batch_id: entry.batch_id.to_string(),
+        operation_id: entry.operation_id.to_string(),
+        action: action.to_string(),
+        from,
+        to,
+        created_at: entry.created_at.to_rfc3339(),
+    }
+}
+
+fn skill_to_dto(skill: &Skill) -> SkillDto {
+    SkillDto {
+        id: skill.id.to_string(),
+        name: skill.name.clone(),
+        enabled: skill.enabled,
+        rule: skill.rule.clone(),
+        created_at: skill.created_at.to_rfc3339(),
+    }
+}
+
+fn parse_uuid(value: &str, field: &str) -> Result<Uuid, String> {
+    Uuid::parse_str(value).map_err(|error| format!("invalid {field}: {error}"))
+}
+
+fn operation_kind_parts(kind: &FileOperationKind) -> (&'static str, Option<String>, String) {
+    match kind {
+        FileOperationKind::CreateFolder { path } => ("create_folder", None, path_to_string(path)),
+        FileOperationKind::MoveFile {
+            source,
+            destination,
+        } => (
+            "move_file",
+            Some(path_to_string(source)),
+            path_to_string(destination),
+        ),
+        FileOperationKind::RenameFile {
+            source,
+            destination,
+        } => (
+            "rename_file",
+            Some(path_to_string(source)),
+            path_to_string(destination),
+        ),
     }
 }
 
@@ -427,11 +861,78 @@ fn category_label(category: &FileCategory) -> &'static str {
     }
 }
 
+fn category_key(category: &FileCategory) -> &'static str {
+    match category {
+        FileCategory::Documents => "documents",
+        FileCategory::Images => "images",
+        FileCategory::Videos => "videos",
+        FileCategory::Audio => "audio",
+        FileCategory::Archives => "archives",
+        FileCategory::Installers => "installers",
+        FileCategory::Code => "code",
+        FileCategory::Spreadsheets => "spreadsheets",
+        FileCategory::Presentations => "presentations",
+        FileCategory::Pdf => "pdf",
+        FileCategory::Other => "other",
+    }
+}
+
+fn parse_category(value: &str) -> Result<FileCategory, String> {
+    match value {
+        "documents" | "Documents" | "文档" => Ok(FileCategory::Documents),
+        "images" | "Images" | "图片" => Ok(FileCategory::Images),
+        "videos" | "Videos" | "视频" => Ok(FileCategory::Videos),
+        "audio" | "Audio" | "音频" => Ok(FileCategory::Audio),
+        "archives" | "Archives" | "压缩包" => Ok(FileCategory::Archives),
+        "installers" | "Installers" | "安装包" => Ok(FileCategory::Installers),
+        "code" | "Code" | "代码" => Ok(FileCategory::Code),
+        "spreadsheets" | "Spreadsheets" | "表格" => Ok(FileCategory::Spreadsheets),
+        "presentations" | "Presentations" | "演示文稿" => Ok(FileCategory::Presentations),
+        "pdf" | "Pdf" | "PDF" => Ok(FileCategory::Pdf),
+        "other" | "Other" | "其他" => Ok(FileCategory::Other),
+        other => Err(format!("unsupported category: {other}")),
+    }
+}
+
 fn risk_label(risk: &FileRiskLevel) -> &'static str {
     match risk {
         FileRiskLevel::Low => "low",
         FileRiskLevel::Medium => "medium",
         FileRiskLevel::High => "high",
+    }
+}
+
+fn parse_risk(value: &str) -> Result<FileRiskLevel, String> {
+    match value {
+        "" | "low" | "Low" => Ok(FileRiskLevel::Low),
+        "medium" | "Medium" => Ok(FileRiskLevel::Medium),
+        "high" | "High" => Ok(FileRiskLevel::High),
+        other => Err(format!("unsupported risk: {other}")),
+    }
+}
+
+fn mode_key(mode: &OrganizationMode) -> &'static str {
+    match mode {
+        OrganizationMode::ByCategory => "by_category",
+        OrganizationMode::ByExtension => "by_extension",
+        OrganizationMode::Desktop => "desktop",
+    }
+}
+
+fn parse_mode(value: &str) -> Result<OrganizationMode, String> {
+    match value {
+        "by_category" | "category" | "ByCategory" => Ok(OrganizationMode::ByCategory),
+        "by_extension" | "extension" | "ByExtension" => Ok(OrganizationMode::ByExtension),
+        "desktop" | "Desktop" => Ok(OrganizationMode::Desktop),
+        other => Err(format!("unsupported organization mode: {other}")),
+    }
+}
+
+fn execution_status_key(status: &smart_file_organizer_core::ExecutionStatus) -> &'static str {
+    match status {
+        smart_file_organizer_core::ExecutionStatus::Completed => "completed",
+        smart_file_organizer_core::ExecutionStatus::PartiallyFailed => "partially_failed",
+        smart_file_organizer_core::ExecutionStatus::Rejected => "rejected",
     }
 }
 
@@ -464,6 +965,12 @@ fn file_to_dto(file: &smart_file_organizer_core::FileItem) -> FileItemDto {
 
 fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+fn display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path_to_string(path))
 }
 
 fn format_size(size_bytes: u64) -> String {
@@ -604,5 +1111,102 @@ mod tests {
             .evidence
             .iter()
             .any(|evidence| evidence.contains("Skill")));
+    }
+
+    #[tokio::test]
+    async fn generate_plan_reclassifies_from_scan_storage_without_core_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("a.pdf"), b"pdf").unwrap();
+        let storage = smart_file_organizer_storage::Storage::in_memory().unwrap();
+        let registry = ScanRegistry::default();
+
+        scan_folder_with_storage(
+            &storage,
+            &registry,
+            ScanFolderRequest {
+                task_id: Some("task-plan".to_string()),
+                root_path: path_to_string(temp.path()),
+                recursive: true,
+                max_depth: None,
+                include_hidden: false,
+                follow_symlinks: false,
+            },
+        )
+        .unwrap();
+
+        let prepared = prepare_generate_plan(
+            &storage,
+            GeneratePlanRequestDto {
+                task_id: "task-plan".to_string(),
+                root_path: path_to_string(temp.path()),
+                mode: "by_category".to_string(),
+                classifications: None,
+            },
+        )
+        .unwrap();
+        let plan = build_prepared_plan(prepared).await.unwrap();
+
+        assert_eq!(plan.task_id, "task-plan");
+        assert_eq!(plan.mode, "by_category");
+        assert!(plan.rows.iter().any(|row| row.operation_type == "move_file"
+            && row.title.contains("a.pdf")
+            && row.selected
+            && row.conflict_status == "none"));
+        assert!(plan.rows.iter().all(|row| !row.editable_target.is_empty()));
+    }
+
+    #[test]
+    fn plan_and_approval_dtos_convert_to_core_execution_contract() {
+        let plan_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let now = chrono::Utc::now().to_rfc3339();
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("a.txt");
+        let target = temp.path().join("Docs").join("a.txt");
+
+        let plan = OrganizationPlanDto {
+            plan_id: plan_id.to_string(),
+            task_id: "task-dto".to_string(),
+            root_path: path_to_string(temp.path()),
+            mode: "by_category".to_string(),
+            rows: vec![OperationRowDto {
+                operation_id: operation_id.to_string(),
+                operation_type: "move_file".to_string(),
+                title: "移动 a.txt".to_string(),
+                source: Some(path_to_string(&source)),
+                target: path_to_string(&target),
+                reason: "test".to_string(),
+                risk: "low".to_string(),
+                selected: true,
+                editable_target: path_to_string(&target),
+                validation_issues: Vec::new(),
+                conflict_status: "none".to_string(),
+                file_id: None,
+            }],
+            summary: PlanSummaryDto {
+                files_considered: 1,
+                folders_to_create: 0,
+                files_to_move: 1,
+                files_to_rename: 0,
+            },
+            created_at: now.clone(),
+        };
+        let approval = UserApprovalDto {
+            approved: true,
+            approved_plan_id: plan_id.to_string(),
+            approved_at: now,
+            actor: Some("tester".to_string()),
+        };
+
+        let core_plan = plan_dto_to_core(plan).unwrap();
+        let core_approval = approval_dto_to_core(approval).unwrap();
+
+        assert_eq!(core_plan.plan_id, plan_id);
+        assert_eq!(core_approval.approved_plan_id, plan_id);
+        assert!(matches!(
+            &core_plan.operations[0].kind,
+            FileOperationKind::MoveFile { source: actual_source, destination }
+                if actual_source == &source && destination == &target
+        ));
     }
 }
