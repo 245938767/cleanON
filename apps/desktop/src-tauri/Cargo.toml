@@ -32,6 +32,7 @@ smart-file-organizer-planner = { path = "../../../crates/planner" }
 smart-file-organizer-executor = { path = "../../../crates/executor" }
 smart-file-organizer-skill-engine = { path = "../../../crates/skill-engine" }
 smart-file-organizer-storage = { path = "../../../crates/storage" }
+smart-file-organizer-ai-gateway = { path = "../../../crates/ai-gateway" }
 
 [dev-dependencies]
 tempfile.workspace = true

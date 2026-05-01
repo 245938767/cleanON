@@ -3515,6 +3515,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "smart-file-organizer-ai-gateway",
  "smart-file-organizer-classifier",
  "smart-file-organizer-core",
  "smart-file-organizer-executor",
