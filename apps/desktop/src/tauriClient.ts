@@ -21,7 +21,9 @@ import type {
   GeneratePlanRequestDto,
   HistorySummaryDto,
   ModelRuntimeTestResult,
+  ModelSettingsListDto,
   ModelSettingsDto,
+  OperationRowDto,
   OrganizationPlanDto,
   RollbackResultDto,
   ScanFolderRequest,
@@ -54,10 +56,6 @@ function getInvoke(): TauriInvoke | null {
   return tauriWindow.__TAURI__?.core?.invoke ?? tauriWindow.__TAURI_INTERNALS__?.invoke ?? null;
 }
 
-function realCommandsEnabled(): boolean {
-  return new URLSearchParams(window.location.search).has("realCommands");
-}
-
 function waitForMock<T>(value: T): Promise<T> {
   return new Promise((resolve) => {
     window.setTimeout(() => resolve(value), commandDelay);
@@ -65,8 +63,7 @@ function waitForMock<T>(value: T): Promise<T> {
 }
 
 function canUseRealCommands(): TauriInvoke | null {
-  const invoke = getInvoke();
-  return invoke && realCommandsEnabled() ? invoke : null;
+  return getInvoke();
 }
 
 export const tauriClient = {
@@ -153,6 +150,18 @@ export const tauriClient = {
     return invoke<OrganizationPlanDto>("review_plan", { plan });
   },
 
+  async patchPlan(plan: OrganizationPlanDto, operations: Array<Pick<OperationRowDto, "operationId"> & { selected?: boolean; editableTarget?: string }>): Promise<OrganizationPlanDto> {
+    const invoke = canUseRealCommands();
+    if (!invoke) {
+      return waitForMock(applyMockPatch(plan, operations));
+    }
+
+    return invoke<OrganizationPlanDto>("patch_plan", {
+      plan,
+      patch: { operations },
+    });
+  },
+
   async executeConfirmedPlan(plan: OrganizationPlanDto, approval: UserApprovalDto): Promise<ExecutionBatchDto> {
     const invoke = canUseRealCommands();
     if (!invoke) {
@@ -172,11 +181,16 @@ export const tauriClient = {
       return waitForMock(mockBatches.map(createHistorySummary));
     }
 
-    try {
-      return await invoke<HistorySummaryDto[]>("list_execution_history");
-    } catch {
-      return mockBatches.map(createHistorySummary);
+    return invoke<HistorySummaryDto[]>("list_execution_batches");
+  },
+
+  async loadExecutionBatch(batchId: string): Promise<ExecutionBatchDto | null> {
+    const invoke = canUseRealCommands();
+    if (!invoke) {
+      return waitForMock(mockBatches.find((batch) => batch.batchId === batchId) ?? null);
     }
+
+    return invoke<ExecutionBatchDto | null>("load_execution_batch", { batchId });
   },
 
   async rollbackBatch(batch: ExecutionBatchDto): Promise<RollbackResultDto> {
@@ -189,11 +203,7 @@ export const tauriClient = {
       return result;
     }
 
-    try {
-      return await invoke<RollbackResultDto>("rollback_batch", { batch });
-    } catch {
-      return createRollbackResult(batch);
-    }
+    return invoke<RollbackResultDto>("rollback_batch_by_id", { batchId: batch.batchId });
   },
 
   async listSkills(): Promise<SkillDto[]> {
@@ -224,11 +234,7 @@ export const tauriClient = {
       return waitForMock(updated);
     }
 
-    try {
-      return await invoke<SkillDto>("set_skill_enabled", { id: skill.id, enabled });
-    } catch {
-      return { ...skill, enabled };
-    }
+    return invoke<SkillDto>("set_skill_enabled", { id: skill.id, enabled });
   },
 
   async deleteSkill(skillId: string): Promise<void> {
@@ -238,11 +244,7 @@ export const tauriClient = {
       return waitForMock(undefined);
     }
 
-    try {
-      await invoke("delete_skill", { id: skillId });
-    } catch {
-      return;
-    }
+    await invoke("delete_skill", { id: skillId });
   },
 
   async loadModelSettings(): Promise<ModelSettingsDto> {
@@ -251,11 +253,8 @@ export const tauriClient = {
       return waitForMock(mockModelSettings);
     }
 
-    try {
-      return await invoke<ModelSettingsDto>("load_model_settings");
-    } catch {
-      return mockModelSettings;
-    }
+    const list = await invoke<ModelSettingsListDto>("list_model_settings");
+    return list.savedSettings[0] ?? mockModelSettings;
   },
 
   async saveModelSettings(settings: ModelSettingsDto): Promise<ModelSettingsDto> {
@@ -266,11 +265,7 @@ export const tauriClient = {
       return waitForMock(sanitized);
     }
 
-    try {
-      return await invoke<ModelSettingsDto>("save_model_settings", { settings: sanitized });
-    } catch {
-      return sanitized;
-    }
+    return invoke<ModelSettingsDto>("save_model_settings", { settings: sanitized });
   },
 
   async testModelRuntime(settings: ModelSettingsDto, apiKey: string): Promise<ModelRuntimeTestResult> {
@@ -279,14 +274,16 @@ export const tauriClient = {
       return waitForMock(createModelTestResult(settings, apiKey));
     }
 
-    try {
-      return await invoke<ModelRuntimeTestResult>("test_model_runtime", {
-        settings,
-        runtimeApiKey: apiKey,
-      });
-    } catch {
-      return createModelTestResult(settings, apiKey);
+    const request = { settings, apiKey };
+    const connection = await invoke<{ requestValid: boolean; message: string }>("test_model_connection", { request });
+    if (!connection.requestValid) {
+      return { ok: false, message: connection.message };
     }
+    const jsonOutput = await invoke<{ valid: boolean; summary: string; categoriesCount: number }>("test_model_json_output", { request });
+    return {
+      ok: jsonOutput.valid,
+      message: `${connection.message} JSON 输出 ${jsonOutput.categoriesCount} 项：${jsonOutput.summary}`,
+    };
   },
 
   async loadDesktopPreview(
@@ -300,18 +297,46 @@ export const tauriClient = {
       return waitForMock(createDesktopPreview(mode, resolvedRoot, plan));
     }
 
-    try {
-      return await invoke<DesktopPreviewDto>("desktop_preview", {
-        request: {
-          mode,
-          rootPath: resolvedRoot,
-          plan,
-        },
-      });
-    } catch {
-      return createDesktopPreview(mode, resolvedRoot, plan);
+    if (plan?.desktopPreview) {
+      return plan.desktopPreview;
     }
+    return createDesktopPreview(mode, resolvedRoot, plan);
   },
 };
 
 type FileItemLike = Parameters<typeof createMockClassifications>[0][number];
+
+function applyMockPatch(
+  plan: OrganizationPlanDto,
+  operations: Array<Pick<OperationRowDto, "operationId"> & { selected?: boolean; editableTarget?: string }>,
+): OrganizationPlanDto {
+  const patched = {
+    ...plan,
+    rows: plan.rows.map((row) => {
+      const patch = operations.find((item) => item.operationId === row.operationId);
+      if (!patch) {
+        return row;
+      }
+      const editableTarget = patch.editableTarget ?? row.editableTarget;
+      const validationIssues = editableTarget.trim()
+        ? row.validationIssues.filter((issue) => issue.message !== "目标路径不能为空")
+        : [{ operationId: row.operationId, message: "目标路径不能为空" }];
+      return {
+        ...row,
+        selected: patch.selected ?? row.selected,
+        editableTarget,
+        validationIssues,
+        conflictStatus: validationIssues.length ? "blocked" as const : "none" as const,
+      };
+    }),
+  };
+  return {
+    ...patched,
+    summary: {
+      filesConsidered: patched.summary.filesConsidered,
+      foldersToCreate: patched.rows.filter((row) => row.selected && row.operationType === "create_folder").length,
+      filesToMove: patched.rows.filter((row) => row.selected && row.operationType === "move_file").length,
+      filesToRename: patched.rows.filter((row) => row.selected && row.operationType === "rename_file").length,
+    },
+  };
+}

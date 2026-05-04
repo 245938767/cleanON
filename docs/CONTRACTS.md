@@ -27,10 +27,10 @@
 - `UserApprovalDto`：前端确认边界，转换为 core `UserApproval { approved, approved_plan_id, approved_at, actor }` 后才能执行。
 - `ExecutionBatchDto`、`HistorySummaryDto`：执行和历史摘要边界，使用稳定字符串状态。
 - `SkillDto`、`SkillUpdateProposalDto`：Skill 列表与保存边界。
-- `ModelSettingsDto`：模型设置边界，只允许 provider、cloudEnabled、model；不得包含 API Key、secret 或 token。
+- `ModelSettingsDto`：模型设置边界，只允许 provider、baseUrl、cloudEnabled、model；不得包含 API Key、secret 或 token。
 
 DTO 中的 `mode`、`operationType`、`risk`、`status` 使用稳定小写字符串，例如
-`by_category`、`move_file`、`low`、`completed`。前端不要依赖 Rust enum 变体名。
+`by_category`、`move_file`、`low`、`completed`。模型 provider 使用 `mock`、`ollama`、`openai-compatible`。前端不要依赖 Rust enum 变体名。
 
 ## 危险 command
 
@@ -42,6 +42,9 @@ DTO 中的 `mode`、`operationType`、`risk`、`status` 使用稳定小写字符
 
 Tauri 层必须只把 `selected = true` 的行转换为 core operation，并使用 `editableTarget` 作为最终目标路径。
 缺少确认、plan id 不匹配、validate 不通过、路径逃逸 root、目标冲突或 source 不存在，都必须拒绝执行。
+
+Diff 编辑必须通过 `patch_plan` 重新验证并持久化 draft，不能只在前端本地修改。历史撤销必须通过批次 id 读取持久化 rollback
+记录，并在撤销成功后把批次状态持久化为 `rolled_back`。
 
 AI、规则引擎、分类器和 planner 只能生成计划 DTO 或 core plan；任何移动、重命名、创建目录动作只能在
 `execute_confirmed_plan` 收到确认并通过验证后发生。

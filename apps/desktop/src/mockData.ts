@@ -125,6 +125,7 @@ export function createMockPlan(
       filesToRename: rows.filter((operation) => operation.operationType === "rename_file").length,
     },
     createdAt: new Date().toISOString(),
+    desktopPreview: mode === "desktop" ? createDesktopPreview(mode, rootPath, null) : null,
   };
 }
 
@@ -188,14 +189,14 @@ export function createMockSkills(): SkillDto[] {
       id: "skill-receipts",
       name: "发票归入票据",
       enabled: true,
-      rule: JSON.stringify({ categoryKey: "receipts", targetFolder: "票据" }, null, 2),
+      rule: { fileNameContains: "发票", category: "Documents", destinationHint: "票据" },
       createdAt: new Date(Date.now() - 86400000).toISOString(),
     },
     {
       id: "skill-installers",
       name: "安装包独立收纳",
       enabled: true,
-      rule: JSON.stringify({ extension: ["dmg", "exe", "msi"], targetFolder: "安装包" }, null, 2),
+      rule: { extension: "dmg", category: "Installers", destinationHint: "安装包" },
       createdAt: new Date(Date.now() - 172800000).toISOString(),
     },
   ];
@@ -213,10 +214,10 @@ export function createSkillFromProposal(proposal: SkillUpdateProposalDto): Skill
 
 export function createDefaultModelSettings(): ModelSettingsDto {
   return {
-    provider: "local",
+    provider: "ollama",
     cloudEnabled: false,
-    baseUrl: "http://127.0.0.1:11434/v1",
-    model: "local-classifier",
+    baseUrl: "http://127.0.0.1:11434",
+    model: "llama3.2",
   };
 }
 
@@ -232,36 +233,80 @@ export function createModelTestResult(settings: ModelSettingsDto, apiKey: string
 
 export function createDesktopPreview(mode: EntryKind, rootPath: string, plan: OrganizationPlanDto | null): DesktopPreviewDto {
   const rows = plan?.rows.filter((operation) => operation.selected) ?? [];
-
-  if (mode !== "desktop") {
-    return {
-      platform: "macos",
-      rootPath,
-      macosArchive: {
-        archiveFolder: `${rootPath}/桌面归档`,
-        rows,
-        note: "文件整理模式不写回桌面图标坐标。",
-      },
-    };
-  }
+  const zones = rows.length
+    ? rows.map((row, index) => ({
+        zoneId: `zone-${index}`,
+        title: row.title,
+        categoryKey: row.risk,
+        archiveFolder: dirnameForMock(row.editableTarget || row.target),
+        fileCount: row.operationType === "create_folder" ? 0 : 1,
+        canvasRect: { x: 64 + index * 36, y: 70 + index * 24, width: 260, height: 120 },
+        fileIds: row.fileId ? [row.fileId] : [],
+      }))
+    : [
+        {
+          zoneId: "zone-work",
+          title: "工作文档",
+          categoryKey: "documents",
+          archiveFolder: `${rootPath}/Desktop Archive/Documents`,
+          fileCount: mode === "desktop" ? 2 : 0,
+          canvasRect: { x: 72, y: 76, width: 420, height: 300 },
+          fileIds: [],
+        },
+        {
+          zoneId: "zone-media",
+          title: "图片素材",
+          categoryKey: "images",
+          archiveFolder: `${rootPath}/Desktop Archive/Images`,
+          fileCount: mode === "desktop" ? 1 : 0,
+          canvasRect: { x: 528, y: 76, width: 360, height: 300 },
+          fileIds: [],
+        },
+        {
+          zoneId: "zone-archive",
+          title: "归档暂存",
+          categoryKey: "archives",
+          archiveFolder: `${rootPath}/Desktop Archive/Archives`,
+          fileCount: mode === "desktop" ? 2 : 0,
+          canvasRect: { x: 924, y: 76, width: 360, height: 300 },
+          fileIds: [],
+        },
+      ];
 
   return {
-    platform: "windows",
-    rootPath,
-    macosArchive: {
-      archiveFolder: `${rootPath}/桌面归档`,
-      rows,
-      note: "macOS MVP 只展示归档目标，不承诺图标坐标级排布。",
+    platform: mode === "desktop" ? "windows" : "macos",
+    capabilities: {
+      previewOnly: true,
+      supportsFileArchivePlan: true,
+      supportsDesktopCanvasPreview: true,
+      supportsIconCoordinateWriteback: false,
+      supportsPixelPerfectLayout: false,
     },
-    windowsPartition: {
+    canvas: {
       width: 1440,
       height: 900,
-      partitions: [
-        { id: "work", label: "工作文档", x: 72, y: 76, width: 420, height: 300, fileCount: 2 },
-        { id: "media", label: "图片素材", x: 528, y: 76, width: 360, height: 300, fileCount: 1 },
-        { id: "archive", label: "归档暂存", x: 924, y: 76, width: 360, height: 300, fileCount: 2 },
-      ],
+      columns: 12,
+      rows: 8,
+      coordinateSpace: "preview",
     },
+    beforeGroups: [
+      {
+        groupId: "group-preview",
+        title: "当前桌面项目",
+        categoryKey: "mixed",
+        fileCount: rows.length,
+        totalSizeBytes: 0,
+        files: rows
+          .filter((row) => row.fileId)
+          .map((row) => ({
+            fileId: row.fileId ?? row.operationId,
+            name: basenameForMock(row.source ?? row.target),
+            path: row.source ?? row.target,
+            sizeBytes: 0,
+          })),
+      },
+    ],
+    afterZones: zones,
   };
 }
 
@@ -293,4 +338,17 @@ function row(
     conflictStatus: "none",
     fileId,
   };
+}
+
+function basenameForMock(path: string): string {
+  return path.split("/").filter(Boolean).pop() ?? path;
+}
+
+function dirnameForMock(path: string): string {
+  const parts = path.split("/").filter(Boolean);
+  parts.pop();
+  if (path.startsWith("~")) {
+    return `~/${parts.slice(1).join("/")}`;
+  }
+  return `/${parts.join("/")}`;
 }

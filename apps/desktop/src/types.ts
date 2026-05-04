@@ -89,6 +89,7 @@ export type OrganizationPlanDto = {
   rows: OperationRowDto[];
   summary: PlanSummaryDto;
   createdAt: string;
+  desktopPreview?: DesktopPreviewDto | null;
 };
 
 export type UserApprovalDto = {
@@ -147,25 +148,46 @@ export type RollbackResultDto = {
   errors: ExecutionErrorDto[];
 };
 
+export type SkillRule = {
+  extension?: string | null;
+  fileNameContains?: string | null;
+  mimePrefix?: string | null;
+  category: "Documents" | "Images" | "Videos" | "Audio" | "Archives" | "Installers" | "Code" | "Spreadsheets" | "Presentations" | "Pdf" | "Other";
+  destinationHint?: string | null;
+};
+
 export type SkillDto = {
   id: string;
   name: string;
   enabled: boolean;
-  rule: string;
+  rule: SkillRule;
   createdAt: string;
 };
 
 export type SkillUpdateProposalDto = {
   name: string;
-  rule: string;
+  rule: SkillRule;
   enabled: boolean;
+  evidence?: string[];
+  sourceEventIds?: string[];
 };
 
 export type ModelSettingsDto = {
-  provider: "local" | "openai_compatible" | "custom";
+  provider: "mock" | "ollama" | "openai-compatible";
   cloudEnabled: boolean;
   baseUrl?: string;
   model?: string | null;
+};
+
+export type ModelSettingsListDto = {
+  providers: Array<{
+    provider: ModelSettingsDto["provider"];
+    label: string;
+    requiresBaseUrl: boolean;
+    requiresApiKey: boolean;
+    cloud: boolean;
+  }>;
+  savedSettings: ModelSettingsDto[];
 };
 
 export type ModelRuntimeTestResult = {
@@ -173,31 +195,59 @@ export type ModelRuntimeTestResult = {
   message: string;
 };
 
-export type MacDesktopArchivePreviewDto = {
-  archiveFolder: string;
-  rows: OperationRowDto[];
-  note: string;
+export type DesktopPreviewPlatform = "macos" | "windows" | "other";
+
+export type DesktopCapabilityFlagsDto = {
+  previewOnly: boolean;
+  supportsFileArchivePlan: boolean;
+  supportsDesktopCanvasPreview: boolean;
+  supportsIconCoordinateWriteback: boolean;
+  supportsPixelPerfectLayout: boolean;
 };
 
-export type WindowsDesktopPartitionDto = {
+export type DesktopPreviewCanvasDto = {
   width: number;
   height: number;
-  partitions: Array<{
-    id: string;
-    label: string;
+  columns: number;
+  rows: number;
+  coordinateSpace: string;
+};
+
+export type DesktopPreviewGroupDto = {
+  groupId: string;
+  title: string;
+  categoryKey: string;
+  fileCount: number;
+  totalSizeBytes: number;
+  files: Array<{
+    fileId: string;
+    name: string;
+    path: string;
+    sizeBytes: number;
+  }>;
+};
+
+export type DesktopPreviewZoneDto = {
+  zoneId: string;
+  title: string;
+  categoryKey: string;
+  archiveFolder: string;
+  fileCount: number;
+  canvasRect: {
     x: number;
     y: number;
     width: number;
     height: number;
-    fileCount: number;
-  }>;
+  };
+  fileIds: string[];
 };
 
 export type DesktopPreviewDto = {
-  platform: "macos" | "windows";
-  rootPath: string;
-  macosArchive?: MacDesktopArchivePreviewDto;
-  windowsPartition?: WindowsDesktopPartitionDto;
+  platform: DesktopPreviewPlatform;
+  capabilities: DesktopCapabilityFlagsDto;
+  canvas: DesktopPreviewCanvasDto;
+  beforeGroups: DesktopPreviewGroupDto[];
+  afterZones: DesktopPreviewZoneDto[];
 };
 
 export type WorkflowState = {

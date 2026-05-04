@@ -353,14 +353,27 @@ async fn load_execution_batch(
 async fn rollback_batch_by_id(app: AppHandle, batch_id: String) -> Result<RollbackResult, String> {
     use smart_file_organizer_executor::{DefaultPlanExecutor, PlanExecutor};
 
-    let batch = load_execution_batch(app, batch_id)
+    let batch_dto = load_execution_batch(app.clone(), batch_id.clone())
         .await?
-        .ok_or_else(|| "execution batch not found".to_string())
-        .and_then(execution_batch_dto_to_core)?;
-    DefaultPlanExecutor
+        .ok_or_else(|| "execution batch not found".to_string())?;
+    let batch = execution_batch_dto_to_core(batch_dto.clone())?;
+    let result = DefaultPlanExecutor
         .rollback_batch(&batch)
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    if result.errors.is_empty() {
+        let mut rolled_back = batch_dto;
+        rolled_back.status = "rolled_back".to_string();
+        rolled_back.rollback_entries.clear();
+        let storage = open_storage(&app)?;
+        storage
+            .mark_execution_batch_rolled_back(
+                &batch_id,
+                &serde_json::to_value(&rolled_back).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -474,6 +487,25 @@ async fn disable_skill(app: AppHandle, id: String) -> Result<bool, String> {
 }
 
 #[tauri::command]
+async fn set_skill_enabled(app: AppHandle, id: String, enabled: bool) -> Result<SkillDto, String> {
+    let storage = open_storage(&app)?;
+    if !storage
+        .set_skill_enabled(&id, enabled)
+        .map_err(|error| error.to_string())?
+    {
+        return Err("skill not found".to_string());
+    }
+    storage
+        .list_skills()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|skill| skill.id == id)
+        .map(stored_skill_to_core)
+        .map(|skill| skill_to_dto(&skill))
+        .ok_or_else(|| "skill not found".to_string())
+}
+
+#[tauri::command]
 async fn delete_skill(app: AppHandle, id: String) -> Result<bool, String> {
     let storage = open_storage(&app)?;
     storage.delete_skill(&id).map_err(|error| error.to_string())
@@ -517,6 +549,7 @@ pub fn run() {
             test_model_connection,
             test_model_json_output,
             disable_skill,
+            set_skill_enabled,
             delete_skill,
             propose_skill_updates
         ])

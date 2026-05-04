@@ -6,8 +6,9 @@ use smart_file_organizer_core::{
     OrganizationPlan, OrganizerError, PlanValidation, RollbackAction, RollbackResult, UserApproval,
     ValidationIssue,
 };
+use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
 #[async_trait]
@@ -67,17 +68,34 @@ fn ensure_approval(plan: &OrganizationPlan, approval: &UserApproval) -> Result<(
 
 fn validate_plan_sync(plan: &OrganizationPlan) -> PlanValidation {
     let mut issues = Vec::new();
-    if !plan.root_path.is_dir() {
+    let root_canonical = match fs::canonicalize(&plan.root_path) {
+        Ok(path) if path.is_dir() => Some(path),
+        _ => {
+            issues.push(ValidationIssue {
+                operation_id: None,
+                message: format!("plan root is not a directory: {}", plan.root_path.display()),
+            });
+            None
+        }
+    };
+    if !plan.root_path.is_dir() && root_canonical.is_some() {
         issues.push(ValidationIssue {
             operation_id: None,
             message: format!("plan root is not a directory: {}", plan.root_path.display()),
         });
     }
 
+    let mut planned_destinations: HashMap<PathBuf, Vec<Uuid>> = HashMap::new();
     for operation in &plan.operations {
         match &operation.kind {
             FileOperationKind::CreateFolder { path } => {
-                validate_inside_root(path, plan, operation.operation_id, &mut issues);
+                validate_inside_root(
+                    path,
+                    plan,
+                    root_canonical.as_deref(),
+                    operation.operation_id,
+                    &mut issues,
+                );
                 if path.exists() && !path.is_dir() {
                     issues.push(ValidationIssue {
                         operation_id: Some(operation.operation_id),
@@ -96,8 +114,24 @@ fn validate_plan_sync(plan: &OrganizationPlan) -> PlanValidation {
                 source,
                 destination,
             } => {
-                validate_inside_root(source, plan, operation.operation_id, &mut issues);
-                validate_inside_root(destination, plan, operation.operation_id, &mut issues);
+                validate_inside_root(
+                    source,
+                    plan,
+                    root_canonical.as_deref(),
+                    operation.operation_id,
+                    &mut issues,
+                );
+                validate_inside_root(
+                    destination,
+                    plan,
+                    root_canonical.as_deref(),
+                    operation.operation_id,
+                    &mut issues,
+                );
+                planned_destinations
+                    .entry(lexical_clean(destination))
+                    .or_default()
+                    .push(operation.operation_id);
                 if !source.is_file() {
                     issues.push(ValidationIssue {
                         operation_id: Some(operation.operation_id),
@@ -120,20 +154,82 @@ fn validate_plan_sync(plan: &OrganizationPlan) -> PlanValidation {
         }
     }
 
+    for (destination, operation_ids) in planned_destinations {
+        if operation_ids.len() > 1 {
+            for operation_id in operation_ids {
+                issues.push(ValidationIssue {
+                    operation_id: Some(operation_id),
+                    message: format!("duplicate planned destination: {}", destination.display()),
+                });
+            }
+        }
+    }
+
     PlanValidation::from_issues(issues)
 }
 
 fn validate_inside_root(
     path: &Path,
     plan: &OrganizationPlan,
+    root_canonical: Option<&Path>,
     operation_id: Uuid,
     issues: &mut Vec<ValidationIssue>,
 ) {
-    if !path.starts_with(&plan.root_path) {
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        issues.push(ValidationIssue {
+            operation_id: Some(operation_id),
+            message: format!(
+                "operation path contains parent traversal: {}",
+                path.display()
+            ),
+        });
+        return;
+    }
+
+    if !lexical_clean(path).starts_with(lexical_clean(&plan.root_path)) {
         issues.push(ValidationIssue {
             operation_id: Some(operation_id),
             message: format!("operation path escapes plan root: {}", path.display()),
         });
+        return;
+    }
+
+    let Some(root_canonical) = root_canonical else {
+        return;
+    };
+    match canonical_existing_ancestor(path) {
+        Ok(existing_ancestor) if existing_ancestor.starts_with(root_canonical) => {}
+        Ok(existing_ancestor) => issues.push(ValidationIssue {
+            operation_id: Some(operation_id),
+            message: format!(
+                "operation path resolves outside plan root: {} via {}",
+                path.display(),
+                existing_ancestor.display()
+            ),
+        }),
+        Err(error) => issues.push(ValidationIssue {
+            operation_id: Some(operation_id),
+            message: format!(
+                "operation path cannot be resolved safely: {} ({error})",
+                path.display()
+            ),
+        }),
+    }
+}
+
+fn canonical_existing_ancestor(path: &Path) -> Result<PathBuf> {
+    let mut candidate = path;
+    loop {
+        if candidate.exists() {
+            return fs::canonicalize(candidate)
+                .with_context(|| format!("canonicalize {}", candidate.display()));
+        }
+        candidate = candidate
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("no existing ancestor"))?;
     }
 }
 
@@ -262,7 +358,6 @@ fn execute_move_file(
     )))
 }
 
-#[allow(dead_code)]
 fn lexical_clean(path: &Path) -> PathBuf {
     path.components().collect()
 }
@@ -415,6 +510,98 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.message.contains("destination already exists")));
+    }
+
+    #[tokio::test]
+    async fn validation_rejects_parent_traversal_escape() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("a.txt");
+        fs::write(&source, b"a").unwrap();
+        let plan = OrganizationPlan {
+            plan_id: Uuid::new_v4(),
+            task_id: "escape".to_string(),
+            root_path: temp.path().to_path_buf(),
+            mode: OrganizationMode::ByCategory,
+            operations: vec![smart_file_organizer_core::FileOperationPlan {
+                operation_id: Uuid::new_v4(),
+                kind: FileOperationKind::MoveFile {
+                    source,
+                    destination: temp.path().join("..").join("outside.txt"),
+                },
+                reason: "escape".to_string(),
+                file_id: None,
+            }],
+            summary: smart_file_organizer_core::PlanSummary {
+                files_considered: 1,
+                folders_to_create: 0,
+                files_to_move: 1,
+                files_to_rename: 0,
+            },
+            created_at: Utc::now(),
+        };
+
+        let validation = DefaultPlanExecutor.validate_plan(&plan).await.unwrap();
+
+        assert!(!validation.valid);
+        assert!(validation
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("parent traversal")));
+    }
+
+    #[tokio::test]
+    async fn validation_rejects_duplicate_planned_destinations() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_source = temp.path().join("a.txt");
+        let second_source = temp.path().join("b.txt");
+        let destination = temp.path().join("Done").join("same.txt");
+        fs::write(&first_source, b"a").unwrap();
+        fs::write(&second_source, b"b").unwrap();
+        let plan = OrganizationPlan {
+            plan_id: Uuid::new_v4(),
+            task_id: "duplicate".to_string(),
+            root_path: temp.path().to_path_buf(),
+            mode: OrganizationMode::ByCategory,
+            operations: vec![
+                smart_file_organizer_core::FileOperationPlan {
+                    operation_id: Uuid::new_v4(),
+                    kind: FileOperationKind::MoveFile {
+                        source: first_source,
+                        destination: destination.clone(),
+                    },
+                    reason: "first".to_string(),
+                    file_id: None,
+                },
+                smart_file_organizer_core::FileOperationPlan {
+                    operation_id: Uuid::new_v4(),
+                    kind: FileOperationKind::MoveFile {
+                        source: second_source,
+                        destination,
+                    },
+                    reason: "second".to_string(),
+                    file_id: None,
+                },
+            ],
+            summary: smart_file_organizer_core::PlanSummary {
+                files_considered: 2,
+                folders_to_create: 0,
+                files_to_move: 2,
+                files_to_rename: 0,
+            },
+            created_at: Utc::now(),
+        };
+
+        let validation = DefaultPlanExecutor.validate_plan(&plan).await.unwrap();
+
+        assert!(!validation.valid);
+        assert_eq!(
+            validation
+                .issues
+                .iter()
+                .filter(|issue| issue.message.contains("duplicate planned destination"))
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]

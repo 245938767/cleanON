@@ -246,6 +246,21 @@ impl Storage {
         Ok(())
     }
 
+    pub fn mark_execution_batch_rolled_back(
+        &self,
+        id: &str,
+        rollback_json: &serde_json::Value,
+    ) -> Result<()> {
+        let rollback_json = serde_json::to_string(rollback_json)?;
+        self.conn.execute(
+            "UPDATE execution_batches
+             SET status = 'rolled_back', rollback_json = ?2
+             WHERE id = ?1",
+            params![id, rollback_json],
+        )?;
+        Ok(())
+    }
+
     pub fn list_execution_batches(&self) -> Result<Vec<HistorySummaryDto>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, plan_id, status, rollback_json, created_at
@@ -303,9 +318,13 @@ impl Storage {
     }
 
     pub fn disable_skill(&self, id: &str) -> Result<bool> {
+        self.set_skill_enabled(id, false)
+    }
+
+    pub fn set_skill_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
         let changed = self.conn.execute(
-            "UPDATE skills SET enabled = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
-            params![id],
+            "UPDATE skills SET enabled = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![id, enabled as i64],
         )?;
         Ok(changed > 0)
     }

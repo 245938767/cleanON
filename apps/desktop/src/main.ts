@@ -8,6 +8,7 @@ import type {
   ModelSettingsDto,
   OperationRowDto,
   OrganizationPlanDto,
+  SkillRule,
   SkillUpdateProposalDto,
   WorkflowState,
   WorkflowView,
@@ -35,10 +36,10 @@ const state: WorkflowState = {
   batches: [],
   skills: [],
   modelSettings: {
-    provider: "local",
+    provider: "ollama",
     cloudEnabled: false,
-    baseUrl: "http://127.0.0.1:11434/v1",
-    model: "local-classifier",
+    baseUrl: "http://127.0.0.1:11434",
+    model: "llama3.2",
   },
   modelTestMessage: null,
   desktopPreview: null,
@@ -294,7 +295,7 @@ function renderBatchCard(batch: ExecutionBatchDto): string {
 
 function renderSkillCenter(): string {
   const selectedEditedRow = getFirstEditedRow();
-  const suggestedRule = selectedEditedRow ? buildRuleFromRow(selectedEditedRow) : "";
+  const suggestedRule = selectedEditedRow ? formatSkillRule(buildRuleFromRow(selectedEditedRow), true) : "";
 
   return `
     <section class="workspace-grid two-column">
@@ -342,7 +343,7 @@ function renderSkillRow(skill: WorkflowState["skills"][number]): string {
     <article class="skill-row">
       <div>
         <h3>${escapeHtml(skill.name)}</h3>
-        <p>${escapeHtml(skill.rule)}</p>
+        <p>${escapeHtml(formatSkillRule(skill.rule))}</p>
         <span>${formatDate(skill.createdAt)}</span>
       </div>
       <div class="row-actions">
@@ -369,9 +370,9 @@ function renderModelSettings(): string {
         <label>
           <span>Provider</span>
           <select name="provider">
-            ${modelOption("local", "本地")}
-            ${modelOption("openai_compatible", "OpenAI Compatible")}
-            ${modelOption("custom", "自定义")}
+            ${modelOption("ollama", "Ollama 本地")}
+            ${modelOption("mock", "Mock")}
+            ${modelOption("openai-compatible", "OpenAI Compatible")}
           </select>
         </label>
         <label>
@@ -402,19 +403,20 @@ function renderModelSettings(): string {
 
 function renderDesktopPreview(entry: EntryKind): string {
   const preview = state.desktopPreview;
+  const archiveRoot = preview?.afterZones[0]?.archiveFolder ?? `${state.selectedRootPath ?? defaultRoot(entry)}/Desktop Archive`;
   return `
     <section class="workspace-grid two-column">
       <section class="panel">
         <div class="panel-heading">
           <div>
             <p class="eyebrow">macOS Archive Preview</p>
-            <h2>${escapeHtml(preview?.macosArchive?.archiveFolder ?? `${state.selectedRootPath ?? defaultRoot(entry)}/桌面归档`)}</h2>
+            <h2>${escapeHtml(archiveRoot)}</h2>
           </div>
           <button class="secondary-command compact" type="button" data-action="refresh-preview">刷新预览</button>
         </div>
-        <p class="action-copy">${escapeHtml(preview?.macosArchive?.note ?? "预览只展示归档目标。")}</p>
+        <p class="action-copy">${escapeHtml(preview?.capabilities.supportsIconCoordinateWriteback ? "当前平台支持坐标写回，但 MVP 仍只做预览。" : "预览只展示归档目标，不写回桌面图标坐标。")}</p>
         <div class="operation-table slim">
-          ${(preview?.macosArchive?.rows ?? state.plan?.rows ?? []).map(renderArchiveRow).join("") || `<div class="empty-state"><h3>暂无桌面计划</h3><p>生成整理方案后会展示归档预览。</p></div>`}
+          ${(preview?.afterZones ?? []).map(renderArchiveZone).join("") || (state.plan?.rows ?? []).map(renderArchiveRow).join("") || `<div class="empty-state"><h3>暂无桌面计划</h3><p>生成整理方案后会展示归档预览。</p></div>`}
         </div>
       </section>
       <section class="panel">
@@ -423,7 +425,7 @@ function renderDesktopPreview(entry: EntryKind): string {
             <p class="eyebrow">Windows Partition Canvas</p>
             <h2>预览分区，不写回坐标</h2>
           </div>
-          <span class="count-chip">${preview?.windowsPartition?.partitions.length ?? 0} 区</span>
+          <span class="count-chip">${preview?.afterZones.length ?? 0} 区</span>
         </div>
         ${renderWindowsCanvas()}
       </section>
@@ -432,24 +434,34 @@ function renderDesktopPreview(entry: EntryKind): string {
 }
 
 function renderWindowsCanvas(): string {
-  const partition = state.desktopPreview?.windowsPartition;
-  if (!partition) {
+  const preview = state.desktopPreview;
+  if (!preview) {
     return `<div class="desktop-canvas empty"><p>桌面整理模式会展示 Windows 分区预览。</p></div>`;
   }
+  const { canvas, afterZones } = preview;
 
   return `
-    <div class="desktop-canvas" style="--canvas-w:${partition.width}; --canvas-h:${partition.height};">
-      ${partition.partitions
+    <div class="desktop-canvas" style="--canvas-w:${canvas.width}; --canvas-h:${canvas.height};">
+      ${afterZones
         .map(
           (item) => `
-            <div class="desktop-zone" style="left:${(item.x / partition.width) * 100}%; top:${(item.y / partition.height) * 100}%; width:${(item.width / partition.width) * 100}%; height:${(item.height / partition.height) * 100}%;">
-              <strong>${escapeHtml(item.label)}</strong>
+            <div class="desktop-zone" style="left:${(item.canvasRect.x / canvas.width) * 100}%; top:${(item.canvasRect.y / canvas.height) * 100}%; width:${(item.canvasRect.width / canvas.width) * 100}%; height:${(item.canvasRect.height / canvas.height) * 100}%;">
+              <strong>${escapeHtml(item.title)}</strong>
               <span>${item.fileCount} 项</span>
             </div>
           `,
         )
         .join("")}
     </div>
+  `;
+}
+
+function renderArchiveZone(zone: NonNullable<WorkflowState["desktopPreview"]>["afterZones"][number]): string {
+  return `
+    <article class="archive-row">
+      <strong>${escapeHtml(zone.title)}</strong>
+      <span>${escapeHtml(zone.archiveFolder)} · ${zone.fileCount} 项</span>
+    </article>
   `;
 }
 
@@ -731,9 +743,8 @@ async function rollback(batchId: string): Promise<void> {
 
   try {
     await tauriClient.rollbackBatch(batch);
-    state.batches = state.batches.map((item) =>
-      item.batchId === batchId ? { ...item, status: "rolled_back", rollbackEntries: [] } : item,
-    );
+    const reloaded = await tauriClient.loadExecutionBatch(batchId);
+    state.batches = state.batches.map((item) => (item.batchId === batchId ? (reloaded ?? { ...item, status: "rolled_back", rollbackEntries: [] }) : item));
     state.status = "rolled-back";
   } catch (error) {
     state.status = "done";
@@ -780,14 +791,11 @@ async function refreshPreview(): Promise<void> {
   render();
 }
 
-function updatePlanSelection(operationId: string, selected: boolean): void {
+async function updatePlanSelection(operationId: string, selected: boolean): Promise<void> {
   if (!state.plan) {
     return;
   }
-  state.plan = {
-    ...state.plan,
-    rows: state.plan.rows.map((row) => (row.operationId === operationId ? { ...row, selected } : row)),
-  };
+  state.plan = await tauriClient.patchPlan(state.plan, [{ operationId, selected }]);
   render();
 }
 
@@ -795,19 +803,7 @@ async function updatePlanTarget(operationId: string, target: string): Promise<vo
   if (!state.plan || !state.entry) {
     return;
   }
-  state.plan = {
-    ...state.plan,
-    rows: state.plan.rows.map((row) =>
-      row.operationId === operationId
-        ? {
-            ...row,
-            editableTarget: target,
-            conflictStatus: target.trim() ? row.conflictStatus : "blocked",
-            validationIssues: target.trim() ? row.validationIssues.filter((issue) => issue.message !== "目标路径不能为空") : [{ operationId, message: "目标路径不能为空" }],
-          }
-        : row,
-    ),
-  };
+  state.plan = await tauriClient.patchPlan(state.plan, [{ operationId, editableTarget: target }]);
   if (!state.editedOperationIds.includes(operationId)) {
     state.editedOperationIds = [...state.editedOperationIds, operationId];
   }
@@ -959,7 +955,7 @@ appRoot.addEventListener("keydown", (event) => {
 appRoot.addEventListener("change", (event) => {
   const target = event.target as HTMLInputElement | HTMLSelectElement;
   if (target.dataset.planToggle) {
-    updatePlanSelection(target.dataset.planToggle, (target as HTMLInputElement).checked);
+    void updatePlanSelection(target.dataset.planToggle, (target as HTMLInputElement).checked);
   }
 });
 
@@ -983,12 +979,21 @@ appRoot.addEventListener("submit", (event) => {
 
 async function submitSkillForm(form: HTMLFormElement): Promise<void> {
   const data = new FormData(form);
+  const rawRule = String(data.get("skillRule") ?? "").trim();
+  let rule: SkillRule;
+  try {
+    rule = parseSkillRule(rawRule);
+  } catch (error) {
+    state.errorMessage = error instanceof Error ? error.message : "规则 JSON 无法解析";
+    render();
+    return;
+  }
   const proposal: SkillUpdateProposalDto = {
     name: String(data.get("skillName") ?? "").trim(),
-    rule: String(data.get("skillRule") ?? "").trim(),
+    rule,
     enabled: data.get("skillEnabled") === "on",
   };
-  if (!proposal.name || !proposal.rule) {
+  if (!proposal.name || !rawRule) {
     return;
   }
   const skill = await tauriClient.saveSkill(proposal);
@@ -1138,17 +1143,13 @@ function getFirstEditedRow(): OperationRowDto | null {
   return state.plan?.rows.find((row) => state.editedOperationIds.includes(row.operationId) && row.editableTarget !== row.target) ?? null;
 }
 
-function buildRuleFromRow(row: OperationRowDto): string {
-  return JSON.stringify(
-    {
-      operationType: row.operationType,
-      sourcePattern: row.source ? basename(row.source) : row.title,
-      targetFolder: dirname(row.editableTarget || row.target),
-      reason: "用户编辑目标后保存",
-    },
-    null,
-    2,
-  );
+function buildRuleFromRow(row: OperationRowDto): SkillRule {
+  return {
+    extension: extensionFromPath(row.source ?? row.target),
+    fileNameContains: row.source ? basename(row.source).split(".")[0] : row.title,
+    category: categoryFromTarget(row.editableTarget || row.target),
+    destinationHint: dirname(row.editableTarget || row.target),
+  };
 }
 
 function summaryToBatch(summary: ReturnType<typeof makeHistorySummaryShape>): ExecutionBatchDto {
@@ -1178,6 +1179,36 @@ function makeHistorySummaryShape() {
 
 function modelOption(value: ModelSettingsDto["provider"], label: string): string {
   return `<option value="${value}" ${state.modelSettings.provider === value ? "selected" : ""}>${label}</option>`;
+}
+
+function formatSkillRule(rule: SkillRule, pretty = false): string {
+  return JSON.stringify(rule, null, pretty ? 2 : 0);
+}
+
+function parseSkillRule(raw: string): SkillRule {
+  const parsed = JSON.parse(raw) as Partial<SkillRule>;
+  return {
+    extension: typeof parsed.extension === "string" && parsed.extension.trim() ? parsed.extension.trim().replace(/^\./, "") : null,
+    fileNameContains: typeof parsed.fileNameContains === "string" && parsed.fileNameContains.trim() ? parsed.fileNameContains.trim() : null,
+    mimePrefix: typeof parsed.mimePrefix === "string" && parsed.mimePrefix.trim() ? parsed.mimePrefix.trim() : null,
+    category: parsed.category ?? "Other",
+    destinationHint: typeof parsed.destinationHint === "string" && parsed.destinationHint.trim() ? parsed.destinationHint.trim() : null,
+  };
+}
+
+function extensionFromPath(path: string): string | null {
+  const fileName = basename(path);
+  const index = fileName.lastIndexOf(".");
+  return index > -1 ? fileName.slice(index + 1).toLowerCase() : null;
+}
+
+function categoryFromTarget(target: string): SkillRule["category"] {
+  const normalized = target.toLowerCase();
+  if (normalized.includes("image") || normalized.includes("图片") || normalized.includes("素材")) return "Images";
+  if (normalized.includes("install") || normalized.includes("安装")) return "Installers";
+  if (normalized.includes("archive") || normalized.includes("zip") || normalized.includes("归档") || normalized.includes("压缩")) return "Archives";
+  if (normalized.includes("pdf") || normalized.includes("票据") || normalized.includes("发票")) return "Documents";
+  return "Other";
 }
 
 function formatRisk(risk: FileRisk): string {
